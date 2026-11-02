@@ -1,0 +1,57 @@
+# Service B: REST API -> pinned to the node labelled lab-role=node-b
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-service
+  namespace: demo
+  labels: {app: api-service}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: api-service}
+  template:
+    metadata:
+      labels: {app: api-service}
+    spec:
+      nodeSelector:
+        lab-role: node-b
+      containers:
+        - name: api-service
+          image: lab/api-service:1.0
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - {name: DATA_SERVICE_ADDR, value: "data-service.demo.svc.cluster.local:50051"}
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+            - name: POD_IP
+              valueFrom: {fieldRef: {fieldPath: status.podIP}}
+          readinessProbe:
+            httpGet: {path: /healthz, port: 8080}
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /healthz, port: 8080}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits:   {cpu: 500m, memory: 256Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-service
+  namespace: demo
+spec:
+  type: NodePort
+  selector: {app: api-service}
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      nodePort: 30080
