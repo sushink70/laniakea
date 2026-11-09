@@ -1697,3 +1697,1182 @@ The function names you see in traces map to files in the kernel source. Search f
 - Don't run unfiltered function tracing on a busy node.
 
 If you'd like, I can write a `stack-inspect.sh` script that finds the pod's veth, snapshots all these counters before and after a request, and prints a hop-by-hop report of what changed.
+
+# Kubernetes and the CNI in one view
+
+I covered pieces of this earlier (pod creation, the packet journey, the veth). This answer puts everything into one picture. The IPs are illustrative.
+
+## 1. The layers
+
+```
++---------------------------------------------------------------------+
+| YOUR APPS      api-service (Go)  --gRPC-->  data-service (Rust)      |
++---------------------------------------------------------------------+
+| SERVICE LAYER  Service name -> ClusterIP -> pod IP                   |
+|                CoreDNS (names), kube-proxy or Cilium eBPF (load bal) |
++---------------------------------------------------------------------+
+| CNI LAYER      pod IP, interface (veth), routes, cross-node tunnel   |
+|                CNI plugin (on pod create/delete) + CNI agent (always)|
++---------------------------------------------------------------------+
+| LINUX KERNEL   network namespaces, veth, bridge, routing, netfilter, |
+|                eBPF, VXLAN                                           |
++---------------------------------------------------------------------+
+| UNDERLAY       VMware network 192.168.17.0/24 (ens33)                |
++---------------------------------------------------------------------+
+```
+
+Each layer only talks to the one below it. Your Go code just dials a name. The CNI layer is what makes the pod IPs behind that name reachable.
+
+## 2. The cluster
+
+```
++--------------------------------------------------------------------------------------+
+|  CONTROL PLANE (node A):  kube-apiserver <--> etcd   scheduler   controller-manager  |
++--------------------------------------------------------------------------------------+
+                 ^                                                  ^
+                 |                                                  |   <- watch/report: pods, nodes, services, endpoints
++-----------------------------------+              +-----------------------------------+
+| NODE A (control-plane)            |              | NODE B (worker)                   |
+| 192.168.17.135 CIDR 10.244.0.0/24 |              | 192.168.17.136 CIDR 10.244.1.0/24 |
+|                                   |              |                                   |
+| kubelet --CRI--> containerd       |              | kubelet --CRI--> containerd       |
+|                     |             |              |                     |             |
+|                  exec CNI         |              |                  exec CNI         |
+|                     v             |              |                     v             |
+| CNI plugin   /opt/cni/bin         |              | CNI plugin   /opt/cni/bin         |
+| CNI agent    (DaemonSet)          |              | CNI agent    (DaemonSet)          |
+| kube-proxy | Cilium eBPF          |              | kube-proxy | Cilium eBPF          |
+|                                   |              |                                   |
+| [POD data-service Rust]           |              | [POD api-service Go]              |
+| [10.244.0.15  :50051]             |              | [10.244.1.23  :8080]              |
+|       | veth                      |              |       | veth                      |
+| [bridge | eBPF]                   |              | [bridge | eBPF]                   |
+|       |                           |              |       |                           |
+| [flannel.1 | cilium_vxlan]        |<==VXLAN====> | [flannel.1 | cilium_vxlan]        |
+|       |                           |              |       |                           |
+| [ens33] 192.168.17.135            |              | [ens33] 192.168.17.136            |
++-----------------------------------+              +-----------------------------------+
+                 |                                                  |
+========================================================================================
+                        underlay: VMware network 192.168.17.0/24
+```
+
+Each node owns a slice of the pod network (a /24 of 10.244.0.0/16). That is what lets the CNI know which node a pod IP lives on and route to it.
+
+## 3. How the CNI is involved: two separate jobs
+
+**Job 1: setting up a pod (once, at creation).** This is the CNI plugin, a short-lived executable.
+
+```
+ scheduler picks node B
+        |
+ kubelet (node B) --CRI--> containerd
+        |
+        | 1. create pause container + EMPTY network namespace
+        | 2. read /etc/cni/net.d/*          (which plugin?)
+        | 3. exec /opt/cni/bin/<plugin>     env: CNI_COMMAND=ADD, CNI_NETNS, CNI_IFNAME=eth0
+        v                                   stdin: JSON config
+ CNI plugin:  create veth pair  ->  allocate IP (IPAM)  ->  set IP + routes in the pod
+              ->  attach host end (bridge | eBPF)  ->  print JSON result
+        |
+ containerd starts your app inside that namespace.   On delete: CNI_COMMAND=DEL
+```
+
+**Job 2: keeping the network working (continuously).** This is the CNI agent, a DaemonSet that runs on every node. It watches the API server for nodes and pods, and keeps the routes, VXLAN forwarding entries (Flannel) or eBPF maps (Cilium) current. When a pod appears on node A, the agent on node B learns that `10.244.0.0/24` is reachable via node A.
+
+## 4. A request end to end
+
+```
+ curl http://192.168.17.136:30080/products
+   |  (1) NodePort -> Service api-service -> pod 10.244.1.23:8080
+   v
+ api-service (Go)
+   |  (2) dial data-service.demo.svc.cluster.local:50051
+   |  (3) DNS: CoreDNS (a pod, reached via the CNI) -> ClusterIP 10.96.77.12
+   |  (4) ClusterIP -> real pod IP 10.244.0.15
+   |        Flannel: kube-proxy iptables DNAT      Cilium: eBPF at connect()
+   |  (5) packet 10.244.1.23 -> 10.244.0.15 leaves eth0 -> veth -> node B
+   |  (6) node B routing: 10.244.0.0/24 is remote -> tunnel device
+   |  (7) VXLAN: outer UDP 8472  192.168.17.136 -> .135,  inner = the pod packet
+   v
+ ==== VMware network ====
+   |  (8) node A strips the outer headers, routes to the veth of 10.244.0.15
+   v
+ data-service (Rust)  -> reads db.json -> replies the same way in reverse
+   v
+ Go: protobuf -> JSON -> HTTP 200 -> curl
+```
+
+## 5. The key ideas
+
+- **Flat pod network.** Every pod gets its own IP, and any pod can reach any other pod without NAT. That is the contract every CNI implements. It is why the Rust service sees B's real pod IP in its log.
+- **A Service is a rule, not a device.** The ClusterIP exists only as a translation to a pod IP, done by kube-proxy (iptables) or Cilium (eBPF). The CNI only carries traffic between pod IPs.
+- **Plugin plus agent.** The plugin runs briefly when pods are created or deleted, and the agent runs forever and keeps cross-node connectivity up to date.
+- **Overlay versus underlay.** The VXLAN tunnel hides pod IPs inside ordinary UDP packets between the VMs, so the VMware network doesn't need to know about 10.244.x.x.
+- **Same job, different method.** Flannel is simple (bridge `cni0`, VXLAN, iptables) and does no NetworkPolicy. Cilium replaces the bridge and iptables with eBPF, and adds policy and visibility with Hubble.
+
+## 6. See it on your cluster
+
+```bash
+kubectl get nodes -o wide
+kubectl get pods -A -o wide                    # CNI agent pods (one per node) and your demo pods
+kubectl get node -o custom-columns=NAME:.metadata.name,CIDR:.spec.podCIDR
+cat /etc/cni/net.d/*                           # which plugin containerd will call
+ls /opt/cni/bin                                # the plugin binaries
+ip route | grep 10.244                         # the route to the other node's pod CIDR
+```
+
+I can go deeper on any one box in these diagrams. The Cilium eBPF path (what happens at connect() and on the veth hook) and the exact Flannel VXLAN tables (`bridge fdb`, `ip neigh`) are the two I'd suggest next.
+
+# Editing Cilium and analyzing the A↔B traffic
+
+I couldn't run any of this (my sandbox has no cluster), so treat the commands as a verified plan, not tested output. The commands come from Cilium's docs and the code layout from its source, but file and function names shift between releases. Always `grep` your own checkout before trusting a name.
+
+## Choose your approach
+
+| Goal | Approach | Rebuild needed? |
+|---|---|---|
+| See what Cilium does with A↔B packets | Turn on Cilium's built-in debug and monitor | No |
+| Change how Cilium handles packets (new log, new rule, new metric) | Edit the source, build an image, roll it into your cluster | Yes |
+| Iterate quickly on code changes | Cilium's kind-based dev loop | Yes, but fast |
+
+I'd start with the first and only edit code once you know what you want to change.
+
+## 1. Analyze the traffic without editing code
+
+Cilium has verbose debug groups. Run `cilium config set debug true` and `cilium config set debug-verbose datapath`, or use the Helm settings `debug.enabled=true` and `debug.verbose=datapath` to make it permanent. Turn it off when done, because it is noisy.
+
+```bash
+cilium config set debug true
+cilium config set debug-verbose datapath
+
+# find the agent pod on the node where api-service runs, and the pods' endpoint IDs
+kubectl -n kube-system get pods -l k8s-app=cilium -o wide
+kubectl -n kube-system exec <cilium-pod-on-node-B> -- cilium-dbg endpoint list
+
+# per-packet datapath events for the api-service endpoint
+kubectl -n kube-system exec <cilium-pod-on-node-B> -- \
+  cilium-dbg monitor --related-to <api-endpoint-id> --type trace --type drop --type policy-verdict -v
+```
+
+The monitor can filter by event type: agent, capture, debug, drop, l7, policy-verdict, trace and trace-sock, with `-v` for more detail. For the most detail on a single pod, `cilium-dbg endpoint config <id> debug=true` turns on BPF-level debug for that endpoint, and setting `monitor-aggregation=none` temporarily stops Cilium from hiding individual trace events.
+
+Each event shows the direction, the source and destination identities, connection state (new, established, reply), the 5-tuple and TCP flags. Send a request with `./scripts/test.sh` and match the events to hops 5 to 9 of the packet journey from earlier.
+
+Cilium's state tables are also readable:
+```bash
+kubectl -n kube-system exec <cilium-pod> -- cilium-dbg bpf ct list global | grep 50051   # connection tracking
+kubectl -n kube-system exec <cilium-pod> -- cilium-dbg bpf lb list                        # Service -> backend
+kubectl -n kube-system exec <cilium-pod> -- cilium-dbg bpf tunnel list                    # pod CIDR -> node IP
+```
+
+## 2. Where the code lives
+
+Cilium attaches `cil_from_container` to each pod's `lxc` interface, and `cil_from_overlay` and `cil_to_overlay` to `cilium_vxlan`. You can confirm this on your nodes with `sudo bpftool net show`.
+
+```
+ api pod eth0 --veth--> lxcB   [tc ingress: cil_from_container]   bpf/bpf_lxc.c
+          |                      service lookup, conntrack, policy, encap decision
+          |                      -> sends trace/drop events to `monitor` and Hubble
+          v
+ cilium_vxlan [tc egress: cil_to_overlay]                         bpf/bpf_overlay.c
+          |
+       ens33 ---- VMware network ----> node A ens33
+          |
+ cilium_vxlan [tc ingress: cil_from_overlay]                      bpf/bpf_overlay.c
+          v
+ lxcA  (policy check for delivery to the data pod)                bpf/bpf_lxc.c
+          v
+ data pod eth0
+```
+
+In `bpf_lxc.c`, the program on the pod's veth enters through `handle_xgress`, then `tail_handle_ipv4` and `handle_ipv4_from_lxc`, where Service destinations are handled. Trace events are sent by `send_trace_notify()` in `bpf/lib/trace.h`, and the event types are defined in `pkg/monitor/api/types.go`. These are the places to read first.
+
+| What you want to change | Look in |
+|---|---|
+| Per-packet decisions on the pod's veth | `bpf/bpf_lxc.c` |
+| VXLAN encapsulation and decapsulation | `bpf/bpf_overlay.c` |
+| The physical NIC and host-side hooks | `bpf/bpf_host.c` |
+| Trace and drop events | `bpf/lib/trace.h`, `bpf/lib/drop.h` |
+| Event types shown by `monitor` | `pkg/monitor/api/types.go` |
+| Agent logic, endpoint management | `daemon/`, `pkg/endpoint/` |
+| Hubble flow parsing | `pkg/hubble/` |
+
+## 3. Build your own Cilium and run it in your cluster
+
+You need Docker, Go, git, make, about 20 GB of free disk space and plenty of patience. The first build takes a long time. Do it on the control-plane VM, which has 8 CPUs and 15 GB of RAM, and take a VMware snapshot first.
+
+**Get the matching source.** Use the same version you have installed, so your changes sit on code you know works:
+```bash
+cilium version                      # note the installed agent version, e.g. 1.19.x
+git clone https://github.com/cilium/cilium.git && cd cilium
+git checkout v<that-version>
+make dev-doctor
+```
+`make dev-doctor` checks that your dev environment has the tools it needs.
+
+**Edit, then build the images:**
+The documented build command is `make docker-cilium-image` for the agent and `make docker-operator-generic-image` for the operator, which produce `quay.io/cilium/cilium:latest` and `quay.io/cilium/operator-generic:latest` locally.
+```bash
+make docker-cilium-image            # builds the agent image (long on first run)
+docker tag quay.io/cilium/cilium:latest lab/cilium-dev:dev1
+docker save lab/cilium-dev:dev1 -o /tmp/cilium-dev1.tar
+```
+You only need to rebuild the operator if you changed it.
+
+**Load it on both nodes** (same method as the lab images, no registry needed):
+```bash
+sudo ctr -n k8s.io images import /tmp/cilium-dev1.tar
+scp /tmp/cilium-dev1.tar iamcloud@<worker-ip>:/tmp/
+ssh -t iamcloud@<worker-ip> "sudo ctr -n k8s.io images import /tmp/cilium-dev1.tar"
+```
+
+**Roll it out:**
+```bash
+cilium upgrade --reuse-values \
+  --set image.repository=lab/cilium-dev \
+  --set image.tag=dev1 \
+  --set image.useDigest=false \
+  --set image.pullPolicy=Never
+
+kubectl -n kube-system rollout status ds/cilium
+cilium status --wait
+kubectl -n kube-system exec ds/cilium -- cilium-dbg version
+```
+
+For each new change, build under a new tag (`dev2`, `dev3`), import it, and re-run the upgrade with the new tag. Reusing a tag makes Kubernetes skip the restart.
+
+## 4. Example edit: log every A↔B packet in the eBPF datapath
+
+This is a sketch to adapt, not a drop-in patch. Names, signatures and variables differ between versions, so open the file and copy the style of the nearby code.
+
+In `bpf/bpf_lxc.c`, find `handle_ipv4_from_lxc()`. After the connection tuple is filled in, add a block like this:
+
+```c
+/* LAB: flag gRPC traffic from the api pod to the data service */
+#ifdef DEBUG
+if (tuple->dport == bpf_htons(50051))
+    cilium_dbg(ctx, DBG_GENERIC, 50051, ct_status);   /* shows up in `monitor --type debug` */
+#endif
+```
+
+Things to know when editing eBPF:
+- `cilium_dbg()` messages only appear when Cilium's debug mode is on, and show up with `cilium-dbg monitor --type debug`.
+- You can also copy an existing `send_trace_notify(...)` call from nearby code to send your own trace event.
+- The kernel's **verifier** must accept the program: no unbounded loops, a small stack (512 bytes), and checked bounds on every packet read. A rejected program means the agent fails to regenerate that endpoint.
+- Compile errors and verifier rejections appear in the agent log: `kubectl -n kube-system logs ds/cilium | grep -iE "error|verifier|compile"`.
+- `make -C bpf checkpatch` checks your BPF changes against the project's coding style.
+
+After you load the new image, send a request and watch:
+```bash
+kubectl -n kube-system exec <cilium-pod-on-node-B> -- cilium-dbg monitor --type debug
+sudo bpftool prog tracelog          # if you used a printk-style helper instead
+```
+
+## 5. A faster dev loop with kind
+
+Cilium's own development flow uses kind: `make kind` creates a cluster, `make kind-image` builds the images and loads them in, and `make kind-install-cilium` installs Cilium. On Linux, `make kind-image-fast` builds locally and mounts the new binary and the BPF source into the running container, which shortens the edit cycle a lot. The `WORKERS` variable sets how many worker nodes the cluster gets, so you can reproduce your two-node A and B layout:
+
+```bash
+cd cilium
+WORKERS=1 make kind
+make kind-image
+make kind-install-cilium
+# then load the lab images into kind and deploy as before:
+kind load docker-image lab/data-service-rs:1.0 lab/api-service-go:1.0
+./scripts/deploy.sh <kind-control-plane-node> <kind-worker-node>
+```
+
+I'd do the actual editing here, because a broken change in kind costs you nothing. Then run the finished build in your kubeadm cluster as in section 3.
+
+## 6. Safety and rollback
+
+- **A broken Cilium breaks pod networking.** A bad BPF change can leave pods without connectivity, including CoreDNS. Snapshot the VM before the first rollout.
+- **Roll back** with `helm -n kube-system rollback cilium` (you'll have helm from the Kubeshark step), or run the upgrade again with the stock image repository and tag.
+- **Debug mode is expensive.** Turn it off afterwards with `cilium config set debug false`.
+- **Pin versions.** Build from the tag that matches your installed Cilium. Mixing a new agent with an old operator or chart can fail in confusing ways.
+
+## 7. Suggested learning path
+
+1. Do section 1 with `./scripts/test.sh` running, and read the events line by line.
+2. Open `bpf/bpf_lxc.c` and follow `handle_ipv4_from_lxc` for the path you saw in the monitor. Use `grep -rn send_trace_notify bpf/` to find the exact trace points.
+3. Make the smallest possible change (one `cilium_dbg` line) in a kind cluster.
+4. Move on to a real behavior change, such as counting A-to-B packets in a BPF map, and read it with `cilium-dbg bpf` or `bpftool map dump`.
+5. Roll the finished build into your kubeadm cluster.
+
+If you'd like, I can write a `build-cilium-dev.sh` script that builds the image, loads it on both nodes and upgrades Cilium in one command, or walk through reading `handle_ipv4_from_lxc` section by section once you've checked out the code.
+
+The BPF C file passes a syntax and type check. I'm now adding the lab runner, the bpftrace scripts, the netfilter kernel module and the README, then I'll package it all.
+
+# Tracking packets in the kernel network stack, by editing kernel source and at the XDP/eBPF level
+
+I put a working lab in `kernel-net-lab.tar.gz`. I could not run it, because my sandbox has no kernel to load programs into. The eBPF C passed a syntax and type check with stub headers, and the shell scripts passed `bash -n`. The kernel module and bpftrace scripts are unchecked. Your first run on the VM is the real test, so send me any error.
+
+## Three levels, from safest to most invasive
+
+| Level | Method | Reboot? | Risk |
+|---|---|---|---|
+| Observe | bpftrace, kprobes, tracepoints | no | very low |
+| Extend | eBPF (XDP and tc), a netfilter kernel module | no | low (a module can crash the kernel) |
+| Modify | patch the kernel source, build, boot | yes | highest |
+
+For tracking packets, eBPF is usually enough. Patch the kernel itself only when you want to learn how the stack works, or need something no hook gives you.
+
+## Where each hook sits in the kernel path
+
+```
+ RX:  NIC / veth / vxlan device
+        |
+        v
+      [ XDP ]            generic (skb) or native (driver)        eBPF   earliest, raw frame
+        |
+        v
+      [ tc ingress ]     cls_bpf / tcx                           eBPF   skb + mark, ifindex
+        |
+        v
+      [ AF_PACKET taps ]  tcpdump sees packets here
+        |
+        v
+      [ ip_rcv ] -> netfilter PREROUTING -> routing -> LOCAL_IN | FORWARD    kprobe / module hook
+        |
+        v
+      [ tcp_v4_rcv ] -> socket queue -> your Go/Rust process
+
+ TX:  app write -> tcp_sendmsg -> ip_output -> netfilter OUTPUT/POSTROUTING
+        -> [ dev_queue_xmit ] -> [ tc egress ] -> driver / veth_xmit / vxlan_xmit
+        (XDP does not see ordinary TX traffic, only RX)
+```
+
+Any function in this path can take a kprobe or fentry. The stable tracepoints are in the `net:*`, `skb:*` and `tcp:*` groups.
+
+## How to identify "the same packet"
+
+The kernel has no per-packet ID, so pick one:
+
+- **skb pointer.** It stays the same on one host while the packet lives. It changes after a clone, and it never carries across nodes.
+- **Flow tuple plus TCP sequence number.** This is stable across hops, tunnels (log the inner header) and nodes. Use this one for A↔B across VXLAN.
+- **XDP metadata or `skb->mark`.** Advanced: pass a tag from XDP to tc on the same host.
+
+The lab logs the tuple, sequence number and flags at each hook, so you can line up one packet's journey.
+
+## Level 1: Patch the kernel source
+
+Take a VMware snapshot first, because a bad kernel can fail to boot. You also need about 40 GB of free disk space, and the first build takes 30 to 90 minutes.
+
+```bash
+# 1. enable source packages (Ubuntu's deb822 format) and get the tools
+sudo sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
+sudo apt update
+sudo apt install -y build-essential bc bison flex libssl-dev libelf-dev libncurses-dev dwarves fakeroot rsync cpio kmod
+
+# 2. fetch the source and check it matches your running kernel
+apt source linux
+cd linux-*/ && head -1 debian.master/changelog       # compare with: uname -r
+
+# 3. start from your running kernel's config
+cp /boot/config-$(uname -r) .config
+scripts/config --disable SYSTEM_TRUSTED_KEYS --disable SYSTEM_REVOCATION_KEYS
+scripts/config --set-str LOCALVERSION "-netlab"
+make olddefconfig
+
+# 4. build and install
+make -j$(nproc) bindeb-pkg
+sudo dpkg -i ../linux-image-*netlab*.deb ../linux-headers-*netlab*.deb
+sudo reboot            # pick the "-netlab" kernel in GRUB if it isn't the default
+```
+
+Keep BTF enabled (the default in Ubuntu's config), because bpftrace and CO-RE eBPF programs need it. If the new kernel fails to boot, choose the old one under **GRUB → Advanced options**.
+
+**Where to edit**
+
+| What you want to see | File and function |
+|---|---|
+| Generic receive, generic XDP, tc ingress, taps | `net/core/dev.c`: `__netif_receive_skb_core` |
+| IP receive and forward | `net/ipv4/ip_input.c` (`ip_rcv`), `net/ipv4/ip_forward.c` (`ip_forward`) |
+| IP transmit | `net/ipv4/ip_output.c` (`ip_output`) |
+| TCP receive | `net/ipv4/tcp_ipv4.c`: `tcp_v4_rcv` |
+| veth hop | `drivers/net/veth.c`: `veth_xmit` |
+| VXLAN encap and decap | `drivers/net/vxlan/vxlan_core.c`: `vxlan_xmit`, `vxlan_rcv` |
+| Drop reasons | `include/net/dropreason*.h` |
+| Existing tracepoints | `include/trace/events/net.h` |
+
+**Example patch:** in `tcp_v4_rcv()`, add this right after the line that re-reads `iph = ip_hdr(skb);` and before the `TCP_SKB_CB` assignments:
+
+```c
+	/* NETLAB: trace the gRPC port */
+	if (unlikely(ntohs(th->dest) == 50051 || ntohs(th->source) == 50051))
+		trace_printk("netlab tcp_v4_rcv skb=%px dev=%s %pI4:%u -> %pI4:%u seq=%u\n",
+			     skb, skb->dev->name,
+			     &iph->saddr, ntohs(th->source),
+			     &iph->daddr, ntohs(th->dest), ntohl(th->seq));
+```
+
+Rebuild only what changed, which is much faster than the first build:
+
+```bash
+make -j$(nproc) && sudo make modules_install install && sudo reboot
+sudo cat /sys/kernel/tracing/trace_pipe          # after boot, run a request
+```
+
+`trace_printk` is fine for a lab and prints a "NOTICE" banner in the log. The proper long-term method is a real tracepoint defined with `TRACE_EVENT` in `include/trace/events/net.h`, which `perf` and bpftrace can then attach to.
+
+To avoid rebooting your VM on every change, `virtme-ng` (`vng`) can build and boot a kernel from your source tree inside QEMU. Run `vng --help` for the exact flags on your version.
+
+## Level 2: A kernel module with netfilter hooks
+
+This changes nothing in the kernel itself. `module/netlab_hook.c` registers hooks at all five IPv4 netfilter points and logs every TCP packet on the port you choose:
+
+```bash
+cd module
+sudo apt install -y linux-headers-$(uname -r) build-essential
+make
+sudo insmod netlab_hook.ko port=50051
+sudo dmesg -w | grep netlab          # in another terminal run ./scripts/test.sh
+sudo rmmod netlab_hook
+```
+
+You get one line per hook (PRE_ROUTING, FORWARD, POST_ROUTING and so on) with the skb pointer, in and out devices, tuple and sequence number. Two limits:
+
+- It only sees the host network namespace.
+- With Cilium's eBPF host routing, packets between a pod's veth and the NIC can skip netfilter completely. An eBPF or kprobe tracer will still see them.
+
+An unsigned module is refused if Secure Boot is on.
+
+## Level 3: XDP and eBPF
+
+`ebpf/pkt_track.bpf.c` has four programs, all observe-only (`XDP_PASS` and `TC_ACT_OK`):
+
+| Program | Hook | What it logs |
+|---|---|---|
+| `xdp_track` | XDP | TCP packets for the tracked port |
+| `xdp_vxlan_track` | XDP | the pod's inner TCP packet, read through the VXLAN header (UDP 8472) |
+| `tc_ingress` | tc/tcx ingress | same, after XDP |
+| `tc_egress` | tc/tcx egress | same, on the way out |
+
+Each event prints the interface index, source and destination IP and port, TCP sequence and ack numbers, the flags byte and the payload size. A per-hook counter map named `hits` counts packets. Output goes to the kernel trace buffer through `bpf_printk`.
+
+**Run the safe lab.** It uses a private veth pair and a namespace, so it can't touch `ens33` or Cilium's devices:
+
+```bash
+sudo apt install -y clang llvm libbpf-dev bpftool netcat-openbsd iproute2
+cd kernel-net-lab/ebpf
+./lab.sh 8080
+```
+
+The script builds the object, creates the veth lab, attaches the programs, sends one TCP exchange with `nc`, and prints the trace. You should see the same packet at `XDP`, then at `TC-IN`, with the reply at `TC-OUT`. The flags byte reads `0x02` for SYN, `0x12` for SYN-ACK, `0x10` for ACK, `0x18` for PSH-ACK and `0x11` for FIN-ACK. That order is the real kernel order: generic XDP runs first, then tc ingress, then the IP stack.
+
+**Verifier note:** the kernel's verifier checks every packet read against `data_end`. The code does that on each header. If you edit it and the load fails, `bpftool prog loadall` prints the verifier log.
+
+## Applying this to your A↔B cluster
+
+Cilium already manages tc programs on every `lxc*` interface and `cilium_vxlan`, and possibly XDP on `ens33` if you enabled acceleration. Attaching your own programs there can conflict or replace Cilium's. Safer options on the real cluster:
+
+1. **Passive probes** (kprobe, fentry, tracepoints) never conflict. Use the bpftrace scripts below.
+2. **XDP on the VXLAN interface:** use `xdp_vxlan_track` on `ens33` in generic mode, but first check `ip link show ens33 | grep xdp` and `bpftool net show dev ens33`. If Cilium has an XDP program there, use a chaining tool such as `xdp-loader` from xdp-tools instead of replacing it.
+3. **tc:** tcx lets several programs share a hook, but mixing it with classic `tc filter` on the same device can fail. Check `bpftool net show dev <if>` before attaching.
+4. **Rebuild with the port:** `make TRACK_PORT=50051`.
+
+For cross-node tracking, record the tuple plus TCP sequence number on both nodes and match them. Timestamps from the trace buffer are per-machine, so they aren't directly comparable. Sync both clocks with `chrony` and expect millisecond-level accuracy at best.
+
+## bpftrace: time each packet through the stack
+
+```bash
+sudo bpftrace bpftrace/stack_path.bt 50051
+```
+
+`stack_path.bt` records a timestamp at `ip_rcv`, keyed by the skb pointer. It prints the time elapsed when the same skb reaches `tcp_v4_rcv`, for packets on your port. This gives per-packet latency through the IP stack on that node, which is useful to compare with and without Cilium policies.
+
+`fn_trace.bt` prints every pass through `veth_xmit`, `ip_rcv`, `ip_forward`, `ip_output`, `vxlan_xmit`, `vxlan_rcv` and `tcp_v4_rcv` with the skb pointer. Run it on a quiet node with one request and follow one `skb=0x...` down the list. Check that each function exists on your kernel with `sudo bpftrace -l 'kprobe:vxlan*'`, and delete the lines for any that don't, because an unknown probe aborts the whole script. Inlined functions can also fail to attach.
+
+## Suggested path
+
+1. Run `./lab.sh` and read the XDP, TC-IN and TC-OUT lines for one exchange.
+2. Run `stack_path.bt` on the node while you send requests with `./scripts/test.sh`.
+3. Load the netfilter module and compare its hook order with the eBPF output.
+4. Run `fn_trace.bt` once and map each function to the files in the table above.
+5. Optionally build the patched kernel and watch your `trace_printk` appear.
+6. For a real tool, replace `bpf_printk` with a ring buffer and write the user-space reader in Go (`cilium/ebpf` with `bpf2go`) or Rust (`aya`). It would merge events from both nodes into one timeline.
+
+If you'd like, I can write that Go or Rust reader next. It would take events from a ring buffer, group them by tuple and sequence number, and print a hop-by-hop timeline for each request.
+
+# How to learn cloud, networking, security, Linux kernel, Kubernetes, containers, CNI and microservices
+
+You are already learning the best way. You build something, break it, and trace what actually happens. The rest of this is about putting those topics in a good order and picking good sources.
+
+## 1. The order matters
+
+```
+ Linux basics --> Networking --> Containers --> Kubernetes --> CNI / eBPF --> Service mesh
+      |              |               |              |
+      +--> Kernel ---+--- Security --+--------------+
+ Cloud (VPC, IAM, managed K8s) rests on networking + security
+ Microservices + observability sit on top of Kubernetes
+```
+
+Containers are Linux features (namespaces, cgroups, veth). Kubernetes networking is Linux networking. CNI and eBPF are the Linux kernel. If the bottom layers are shaky, everything above feels like magic. If they're solid, the upper layers are mostly names for things you already understand.
+
+## 2. Habits that work for all of it
+
+- **Build, break, trace.** Every concept gets a lab, then a deliberate failure, then a trace of what happened. Keep one GitHub repo as a lab journal.
+- **Read primary sources.** Man pages (`man 7 namespaces`, `man 7 ip`), kernel docs at docs.kernel.org, RFCs (791 IP, 793 TCP, 7348 VXLAN), the CNI spec and Kubernetes enhancement proposals (KEPs).
+- **Write it up.** Explaining a packet's path in your own words (like the diagrams earlier) finds gaps fast.
+- **Time-box.** A steady 8 to 10 hours a week beats bursts: about 3 reading, 5 hands-on, 1 writing, 1 review.
+- **Treat certifications as checkpoints, not goals.** Check the current curriculum on the issuer's site before you pay.
+
+## 3. Topic by topic
+
+### Linux and the kernel
+- **Books:** *How Linux Works* (Ward), *The Linux Programming Interface* (Kerrisk), *Operating Systems: Three Easy Pieces* (free online), *Linux Kernel Development* (Love), *Systems Performance* (Gregg).
+- **Free:** man7.org, LWN.net (read the networking and BPF articles), kernelnewbies.org, docs.kernel.org/networking, Bootlin's free training slides, MIT 6.S081 (xv6) if you want the OS internals course.
+- **Projects:** a tracing session with `bpftrace` and `perf`, the kernel build and `trace_printk` patch from the last answer, and a small kernel module.
+- **Go further:** read `net/core/dev.c` and `net/ipv4/tcp_ipv4.c` along with a trace of a real packet. Later, send a documentation fix or a selftest to the kernel.
+
+### Networking
+- **Books:** *Computer Networking: A Top-Down Approach* (Kurose and Ross), *TCP/IP Illustrated Vol. 1* (Stevens, Fall), *High Performance Browser Networking* (Grigorik, free online).
+- **Free:** Beej's Guide to Network Programming, Julia Evans' zines on networking and debugging, Cloudflare's blog, packagecloud's "Monitoring and Tuning the Linux Networking Stack" series, and Stanford CS144 (you build a TCP stack).
+- **Skills to build:** read packets in Wireshark and `tcpdump` until the TCP handshake, retransmission and MTU issues feel ordinary. Learn subnetting, routing, NAT, DNS, TLS, and how VXLAN and VLAN work.
+- **Projects:** the veth and namespace lab, then a bridge, then a VXLAN tunnel between two VMs by hand (without Kubernetes).
+
+### Containers
+- **Learn:** namespaces, cgroups, overlay filesystems, OCI images, and the split between Docker, containerd and runc.
+- **Resources:** Liz Rice's "Containers from Scratch" talk, *Container Security* (Rice), and iximiuz Labs for hands-on playgrounds.
+- **Project:** build a mini container runtime in Go or Rust that uses `clone` with namespaces, a `chroot` or pivot_root, and a cgroup limit. This single project explains Docker, Kubernetes pods and CNI at once.
+
+### Kubernetes
+- **Start:** the official tutorials, then *Kubernetes in Action* (Lukša).
+- **Go deep:** Kelsey Hightower's *Kubernetes The Hard Way*, then *Production Kubernetes* and *Kubernetes Patterns*. Read the architecture docs and a few KEPs.
+- **Practice:** killercoda.com for free browser labs, or killer.sh if you plan to sit CKA or CKAD.
+- **Projects:** your two-node kubeadm cluster is a good start. Add RBAC, resource limits, probes, rolling updates, PodDisruptionBudgets and a failed-node exercise (shut a node down and watch).
+
+### CNI, eBPF and XDP
+- **Spec:** read the CNI `SPEC.md` in the containernetworking/cni repository. It's short.
+- **Books:** *Learning eBPF* (Rice), *BPF Performance Tools* (Gregg).
+- **Hands-on:** the xdp-project's `xdp-tutorial` on GitHub (the best structured XDP course), ebpf.io, Cilium's docs and Isovalent's free labs, and the Cilium community Slack.
+- **Projects:** write your own CNI plugin in Go (a simple bridge plugin using the `containernetworking/plugins` library) and run it in your cluster. Then build the packet tracker with a ring buffer and a user-space reader, and finally read Cilium's `bpf_lxc.c`.
+
+### Security
+- **Layers:** Linux (capabilities, seccomp, AppArmor or SELinux), containers (rootless, image scanning, supply chain), Kubernetes (RBAC, Pod Security, NetworkPolicy, secrets), network (TLS, mTLS, zero trust), application (OWASP Top 10).
+- **Resources:** *Container Security* (Rice), *Security Engineering* (Anderson, free online), PortSwigger Web Security Academy (free), OWASP cheat sheets, the CIS benchmarks, and the Kubernetes security docs.
+- **Hands-on:** Kubernetes Goat (a deliberately vulnerable cluster), TryHackMe or Hack The Box, kube-bench, Trivy and Falco or Tetragon.
+- **Projects:** attack your own lab (escape a privileged pod, read a service account token), then fix it with RBAC, NetworkPolicy and Pod Security. Write a Cilium policy that only lets api-service reach data-service. Consider CKS later.
+
+### Cloud
+- **Pick one provider first.** AWS is the most common, and what you learn maps to Azure and GCP.
+- **Path:** Cloud Practitioner basics, then Solutions Architect Associate content (courses from Adrian Cantrill or Stephane Maarek are well regarded). Spend your hands-on time on VPC, subnets, route tables, security groups, IAM, load balancers and managed Kubernetes.
+- **Infrastructure as code:** Terraform or OpenTofu, using the provider's own tutorials.
+- **Project:** rebuild your A and B lab on managed Kubernetes (EKS or GKE) with Terraform. Compare how its CNI differs from Flannel and Cilium.
+- **Set a budget alert on day one** and destroy resources when you finish a lab, so a forgotten cluster doesn't cost you money.
+
+### Microservices and observability
+- **Books:** *Building Microservices* (Newman), *Designing Data-Intensive Applications* (Kleppmann, the single best book for this area), *Release It!* (Nygard), the free *Site Reliability Engineering* book, *Observability Engineering*.
+- **Skills:** timeouts, retries, circuit breakers, idempotency, API versioning, service discovery, tracing, metrics, logs.
+- **Tools:** gRPC docs, OpenTelemetry, Prometheus and Grafana, Jaeger, and a service mesh (Istio, Linkerd or Cilium's).
+- **Projects:** extend your Rust and Go services with a third service, OpenTelemetry tracing across A and B, Prometheus metrics, a timeout and retry policy, and failure injection (kill pods, add latency with `tc netem`) to see how the system behaves.
+
+## 4. A six-month sketch (about 10 hours a week)
+
+| Months | Focus | Milestone project |
+|---|---|---|
+| 1 | Linux and networking fundamentals | Build a container by hand with netns, veth, a bridge and VXLAN |
+| 2 | Containers and Docker internals | A mini container runtime in Go or Rust |
+| 3 | Kubernetes (Hard Way, CKA content) | Your two-node cluster, RBAC and a node-failure drill |
+| 4 | CNI, eBPF and XDP | Your own CNI plugin plus the packet tracker with a user-space reader |
+| 5 | Security | Attack and harden your cluster, write NetworkPolicy and Cilium policy |
+| 6 | Cloud, microservices and observability | Deploy A and B on managed Kubernetes with tracing and metrics, via Terraform |
+
+The kernel track runs alongside all six months: read an LWN article a week, and build and patch the kernel once.
+
+## 5. Build a portfolio as you go
+
+Put every lab in a repo with a README that has your diagrams and what you learned, the way we've done in this conversation. A well-explained packet-trace project, a CNI plugin, or an eBPF tracer shows more than a certificate does. Open source is a good next step: documentation and "good first issue" tickets in Cilium, Kubernetes or Linux kernel selftests are realistic places to start.
+
+## 6. Pitfalls to avoid
+
+- **Collecting tutorials without building.** If you read for more than two hours without touching a terminal, switch to a lab.
+- **Skipping the foundations** to reach Kubernetes or eBPF faster. You'll hit confusing problems that are really TCP or Linux routing questions.
+- **Learning every cloud at once.** Go deep on one.
+- **Fixing instead of understanding.** When a lab breaks, trace why before you fix it. That is where most of the learning happens.
+
+If you tell me your goal (platform or SRE, network or security engineering, or kernel and eBPF development) and how many hours a week you can spare, I can turn this into a week-by-week plan with specific exercises built on the cluster and code you already have.
+
+# Protocols and technologies in cloud, cloud-native and microservices
+
+This is a map of what you will meet and what each piece does in a real cloud. The earlier answers covered how to practice them.
+
+## 0. The layers
+
+```
+ APPLICATION   REST/JSON  gRPC  GraphQL  WebSocket  Kafka  AMQP  MQTT  CloudEvents
+ SECURITY      TLS/mTLS  OAuth2/OIDC  JWT  SPIFFE  IAM  WireGuard/IPsec
+ SERVICE       DNS  load balancing  service mesh (xDS)  API gateway  Gateway API
+ TRANSPORT     TCP  UDP  QUIC
+ NETWORK       IPv4/IPv6  ICMP  BGP  NAT  ECMP/Anycast
+ OVERLAY       VXLAN  Geneve  GRE  (pod and VPC networks)
+ LINK          Ethernet  ARP/NDP  VLAN  veth  bridges
+ PLATFORM      KVM/virtio  containers (OCI)  CRI  CNI  CSI  Kubernetes API
+```
+
+## 1. Cloud networking protocols
+
+| Protocol | What it does | Where it shows up in cloud |
+|---|---|---|
+| **Ethernet, ARP/NDP, VLAN** | Local delivery and address resolution | Virtual NICs, node networks, veth pairs |
+| **IPv4 / IPv6, ICMP** | Addressing, routing, errors and ping | VPC and subnet CIDRs, pod IPs, path MTU discovery |
+| **TCP** | Reliable byte stream | Nearly all service traffic |
+| **UDP** | Connectionless datagrams | DNS, tunnels, video, QUIC |
+| **QUIC / HTTP/3** | Encrypted transport over UDP | CDNs and some load balancers |
+| **DNS** (and DoH/DoT, DNSSEC) | Name to address, service discovery | Managed DNS, CoreDNS in Kubernetes |
+| **DHCP** | Hands addresses to instances | VPC DHCP options, node boot |
+| **NAT (SNAT/DNAT)** | Address translation | NAT gateways, Services, masquerading |
+| **BGP** | Exchanges routes between networks | Dedicated links to on-prem, Cilium and Calico BGP, MetalLB |
+| **ECMP, Anycast** | Spreads traffic over equal paths, one IP at many places | Global load balancers, CDNs |
+| **VXLAN, Geneve, GRE** | Overlay tunnels (L2 or L3 inside UDP/IP) | Flannel, Cilium, OVN, gateway appliances |
+| **IPsec, WireGuard** | Encrypted tunnels | Site-to-site VPNs, node-to-node pod encryption |
+| **TLS 1.3, mTLS, X.509** | Encryption and identity | HTTPS everywhere, service-to-service security |
+| **PROXY protocol, X-Forwarded-For** | Preserve client IP through proxies | L4 and L7 load balancers |
+| **BFD, LACP** | Fast failure detection, link aggregation | Underlay data-centre networks |
+| **NetFlow, IPFIX, sFlow, VPC Flow Logs** | Flow telemetry | Security analysis, troubleshooting |
+
+**How to use these in the cloud**
+1. Design a VPC with subnets, route tables and an internet gateway, and put private workloads behind a NAT gateway.
+2. Control traffic with security groups (stateful, per instance) and network ACLs (stateless, per subnet).
+3. Connect networks with peering, a transit hub, a VPN (IPsec) or a dedicated line (BGP).
+4. Put a load balancer in front: L4 for raw TCP and UDP, L7 for HTTP routing and TLS termination.
+5. Use private endpoints so traffic to managed services never crosses the public internet.
+6. Turn on flow logs and read them when something is blocked.
+
+## 2. Cloud computing: compute, storage, identity and management
+
+| Area | Technologies | What to know |
+|---|---|---|
+| **Virtualization** | KVM/QEMU, Xen, Hyper-V, virtio, SR-IOV, DPDK, SmartNICs | Virtio gives VMs fast virtual NICs and disks. SR-IOV and DPDK skip the kernel for speed. |
+| **Lightweight isolation** | Firecracker microVMs, gVisor, Kata Containers | Used for serverless and multi-tenant safety. |
+| **Block storage** | iSCSI, NVMe over Fabrics | Network-attached disks for VMs and volumes |
+| **File storage** | NFS, SMB/CIFS | Shared volumes (managed file services speak these) |
+| **Object storage** | S3 API (HTTP, REST, signed requests), Ceph/Rook | Backups, artefacts, data lakes, static sites |
+| **Identity and auth** | OAuth 2.0, OpenID Connect, SAML, JWT, LDAP, Kerberos, SCIM, API-signing schemes | Single sign-on, tokens, roles for machines |
+| **Workload identity** | IAM roles, IRSA and similar, SPIFFE/SPIRE | Pods and VMs get short-lived credentials with no stored keys |
+| **Management APIs** | REST over HTTPS (some gRPC), OpenAPI | Everything in a cloud is an API call |
+| **Infrastructure as code** | Terraform/OpenTofu, CloudFormation, Bicep, Pulumi, Ansible, Crossplane | Declare infrastructure in files, review it and apply it |
+| **Provisioning** | cloud-init, Packer, PXE, IPMI/Redfish | First boot configuration and image building |
+| **Time** | NTP, PTP, chrony | Needed for logs, certificates and distributed systems |
+| **Remote access** | SSH, RDP, session managers | Prefer short-lived and audited access |
+
+**How to use these in the cloud**
+- Never use long-lived keys. Give each workload a role (or a workload identity) and let it fetch temporary credentials.
+- Put everything in Terraform so environments are reproducible and reviewable.
+- Use object storage for anything that isn't a database, and lock down its bucket policies.
+- Use a secrets service and a key service (KMS) for passwords and encryption keys.
+
+## 3. Cloud-native: containers and Kubernetes
+
+| Technology | What it does |
+|---|---|
+| **OCI image, runtime and distribution specs** | The standard container formats (Docker, containerd, runc, registries) |
+| **CRI** (gRPC) | How kubelet talks to containerd or CRI-O |
+| **CNI** (exec plus JSON) | How a runtime gives a pod its network (Flannel, Calico, Cilium, cloud VPC CNIs) |
+| **CSI** (gRPC) | How Kubernetes attaches storage from any vendor |
+| **Kubernetes API** (REST/HTTPS with watch) | The control interface; everything is an object |
+| **etcd** (Raft consensus, gRPC) | The cluster's database |
+| **CRDs and operators** | Extend Kubernetes with your own object types and controllers |
+| **Admission webhooks, OPA/Gatekeeper, Kyverno** | Enforce policy when objects are created |
+| **Service, EndpointSlice, CoreDNS** | Stable names and virtual IPs for pods |
+| **kube-proxy** (iptables, IPVS, nftables) or **Cilium eBPF** | Implements Services |
+| **Ingress, Gateway API** | HTTP routing into the cluster |
+| **NetworkPolicy, CiliumNetworkPolicy** | Who may talk to whom |
+| **RBAC, Pod Security, seccomp, AppArmor** | Access control and sandboxing |
+| **Helm, Kustomize** | Package and customize manifests |
+| **GitOps (Argo CD, Flux)** | Git is the source of truth, the cluster syncs from it |
+| **eBPF and XDP** (Cilium, Tetragon, Falco) | Fast networking, observability and runtime security |
+| **Sigstore/cosign, SBOM (SPDX, CycloneDX), SLSA** | Supply chain security: signed images and bills of materials |
+| **Knative, KEDA** | Serverless and event-driven autoscaling |
+| **HPA, VPA, Cluster Autoscaler** | Scale pods and nodes |
+
+**How to use these in the cloud**
+1. Use the managed Kubernetes service so the control plane is run for you.
+2. Learn which CNI the provider uses. Some give pods real VPC IPs with no overlay, and some are Cilium-based. This changes how you plan IP space and policy.
+3. Build images in CI, scan and sign them, and push them to the provider's registry.
+4. Deploy through GitOps instead of running `kubectl apply` by hand.
+5. Set resource requests, probes and autoscaling for every workload.
+6. Enforce NetworkPolicy and Pod Security from the start.
+
+## 4. Microservices: how services talk and how they survive failure
+
+### Synchronous communication
+
+| Protocol | Style | Use when |
+|---|---|---|
+| **HTTP/1.1 + JSON (REST)** | Resources and verbs, human-readable | Public APIs, browsers, broad compatibility |
+| **gRPC** (HTTP/2 + protobuf) | Typed contracts, streaming, compact | Internal service-to-service calls (like your A and B) |
+| **GraphQL** | Client chooses fields | Aggregating data for web and mobile clients |
+| **WebSocket, Server-Sent Events** | Long-lived push | Chat, live dashboards |
+| **JSON-RPC, Thrift** | Other RPC styles | Specific ecosystems |
+
+### Asynchronous communication
+
+| Technology | What it is | Typical use |
+|---|---|---|
+| **Kafka** (binary over TCP) | Distributed log | Event streams, high volume, replay |
+| **RabbitMQ / AMQP** | Broker with queues and routing | Task queues, work distribution |
+| **MQTT** | Lightweight pub/sub | IoT devices |
+| **NATS, Pulsar** | Messaging and streaming | Low-latency messaging, multi-tenant streaming |
+| **Cloud queues and topics** | Managed queue, pub/sub and event buses | Decoupling without running brokers |
+| **CloudEvents, AsyncAPI** | Event envelope and event API description | Interoperable event formats |
+| **Webhooks** | HTTP callbacks | Notifying third parties |
+
+### Data formats and contracts
+- **Formats:** JSON, Protocol Buffers, Avro (with a schema registry), MessagePack, FlatBuffers, YAML.
+- **Contracts:** OpenAPI for REST, `.proto` files for gRPC, AsyncAPI and schema registries for events.
+- **Rule:** never change a published contract in a breaking way. Add fields, version endpoints, and keep old versions alive until clients move.
+
+### Resilience and design patterns
+
+| Pattern | Purpose |
+|---|---|
+| **Timeouts, retries with backoff and jitter** | Survive slow or flaky dependencies without piling on load |
+| **Circuit breaker, bulkhead** | Stop failures spreading between services |
+| **Idempotency keys** | Make retries safe |
+| **Rate limiting, load shedding** | Protect a service from overload |
+| **API gateway, BFF** | One entry point (auth, routing, throttling) per client type |
+| **Saga** | Multi-service transactions without a distributed lock |
+| **CQRS and event sourcing** | Separate read and write models, keep history as events |
+| **Transactional outbox plus change data capture** (Debezium) | Publish events reliably when data changes |
+| **Sidecar and service mesh** | Move retries, mTLS and telemetry out of application code |
+| **Service discovery** | DNS or a registry so services find each other |
+| **Blue-green and canary releases** | Roll out safely and roll back fast |
+| **Feature flags** | Release code without turning it on |
+| **Strangler fig** | Move from a monolith gradually |
+
+### Data and coordination
+- **Databases:** PostgreSQL and MySQL (their own wire protocols), Redis (RESP), Cassandra (CQL), MongoDB, and the managed equivalents.
+- **Consensus and membership:** Raft (etcd, Consul), Paxos, gossip protocols (SWIM) and CRDTs, which sit under many distributed systems.
+- **Rule of thumb:** each service owns its data. Share through APIs or events, not through a shared database.
+
+### Observability
+
+| Technology | Role |
+|---|---|
+| **OpenTelemetry** (OTLP over gRPC or HTTP) | Traces, metrics and logs from your code |
+| **W3C Trace Context** (`traceparent` header) | Carries a trace ID across services |
+| **Prometheus** (pull model, text exposition format) | Metrics |
+| **Grafana, Loki, Tempo, Jaeger** | Dashboards, logs, traces |
+| **Fluent Bit and similar** | Log shipping |
+| **Hubble, flow logs** | Network-level visibility |
+
+## 5. Security protocols and technologies (across all layers)
+
+| Layer | Technologies |
+|---|---|
+| **Transport** | TLS 1.3, mTLS, WireGuard, IPsec, certificate automation (ACME, cert-manager) |
+| **Identity** | OAuth 2.0, OIDC, SAML, JWT, SPIFFE/SPIRE, cloud IAM roles, workload identity |
+| **Network** | Security groups, NetworkPolicy, firewalls, WAF, DDoS protection, private endpoints |
+| **Secrets and keys** | Vault, cloud KMS and secret managers, envelope encryption |
+| **Workload** | seccomp, AppArmor/SELinux, capabilities, rootless containers, Pod Security |
+| **Runtime detection** | Falco, Tetragon (eBPF) |
+| **Supply chain** | Image scanning, cosign signatures, SBOMs, SLSA |
+| **Posture and compliance** | CIS benchmarks, kube-bench, cloud posture tools |
+
+**How to use these in the cloud**
+- Zero trust: every call is authenticated and authorized, even inside the VPC.
+- Terminate TLS at the edge, and use mTLS inside the cluster (a service mesh or Cilium can provide it).
+- Issue users tokens through OIDC, and issue services short-lived identities.
+- Apply least privilege everywhere: IAM roles, RBAC, NetworkPolicy.
+
+## 6. The same ideas as named cloud services
+
+| Concept | AWS | Azure | Google Cloud |
+|---|---|---|---|
+| Virtual network | VPC | VNet | VPC |
+| L4 load balancer | Network Load Balancer | Load Balancer | Network Load Balancer |
+| L7 load balancer | Application Load Balancer | Application Gateway | Application Load Balancer |
+| DNS | Route 53 | Azure DNS | Cloud DNS |
+| NAT | NAT Gateway | NAT Gateway | Cloud NAT |
+| Private access to services | PrivateLink | Private Link | Private Service Connect |
+| Dedicated link to on-prem | Direct Connect | ExpressRoute | Cloud Interconnect |
+| VPN | Site-to-Site VPN | VPN Gateway | Cloud VPN |
+| Hub routing | Transit Gateway | Virtual WAN | Network Connectivity Center |
+| Firewalling | Security Groups, NACLs | NSGs | VPC firewall rules |
+| Managed Kubernetes | EKS | AKS | GKE |
+| Container registry | ECR | ACR | Artifact Registry |
+| Object storage | S3 | Blob Storage | Cloud Storage |
+| Messaging | SQS, SNS, EventBridge | Service Bus, Event Grid | Pub/Sub |
+| Identity | IAM | Entra ID and RBAC | Cloud IAM |
+| Keys and secrets | KMS, Secrets Manager | Key Vault | KMS, Secret Manager |
+| Observability | CloudWatch, X-Ray | Azure Monitor | Cloud Monitoring, Cloud Trace |
+| Serverless | Lambda | Functions | Cloud Functions, Cloud Run |
+| API management | API Gateway | API Management | API Gateway, Apigee |
+
+Service names and features change, so check each provider's docs before you design around one.
+
+## 7. Your own lab, mapped to these protocols
+
+```
+ curl ----HTTP/1.1 + JSON----------------------> api-service (Go)
+ api-service --DNS (UDP 53)-------------------> CoreDNS
+ api-service --gRPC = HTTP/2 + protobuf-------> data-service (Rust)
+      carried by:  TCP -> IP -> [VXLAN in UDP 8472] -> Ethernet (ARP finds the next hop)
+ kubectl --HTTPS + TLS + RBAC REST------------> kube-apiserver --gRPC--> etcd (Raft)
+ kubelet --CRI (gRPC)--> containerd --CNI (exec + JSON)--> Flannel / Cilium plugin
+```
+
+In your cluster you have already touched about twenty of the technologies above. Moving to a cloud mostly swaps names: the overlay becomes the VPC's own networking, `kubeadm` becomes a managed control plane, and your NodePort becomes a cloud load balancer.
+
+## 8. A practical way to learn them
+
+1. **Pick one protocol per week** and capture it in Wireshark (DNS, TCP, TLS, HTTP/2 and gRPC, VXLAN).
+2. **Add a protocol to your lab each time:** a TLS or mTLS setup, a Kafka or NATS event from A to a third service, OpenTelemetry tracing, a NetworkPolicy.
+3. **Take the lab to one cloud** with Terraform: VPC, managed Kubernetes, a load balancer, DNS and IAM roles for the pods.
+4. **Break things deliberately:** drop UDP 8472 and see the tunnel fail, expire a certificate, add 200 ms of latency with `tc netem`, and watch your timeouts and retries.
+
+If you'd like, I can take one section from this map and turn it into a hands-on lab on your cluster. Good candidates are mTLS between A and B, adding Kafka or NATS as a third service, or OpenTelemetry tracing across the Go and Rust services.
+
+# API gateways and Emissary-Ingress in your setup
+
+You don't need one. Service B already does the API job for your lab: it takes REST requests and turns them into gRPC calls to A. A gateway is an optional component at the edge of the cluster. It becomes worth adding if you want TLS, several services behind one address, auth, rate limits or canary releases. It's also a good thing to learn, because real clusters almost always have one.
+
+## What an API gateway is
+
+A gateway is a smart reverse proxy at the cluster edge. It receives client requests first and decides what happens to them.
+
+```
+ NOW                                       WITH A GATEWAY
+
+ curl                                      curl  https://api.lab.local/products
+   |  :30080 (NodePort)                      |  :443
+   v                                         v
+ [ api-service B ]                         [ Gateway (Envoy) ]   TLS, routing, auth, limits
+   |  gRPC                                   |  HTTP
+   v                                         v
+ [ data-service A ]                        [ api-service B ] --gRPC--> [ data-service A ]
+```
+
+It handles north-south traffic (clients into the cluster). Traffic between your services (B to A) is east-west traffic, which stays with the CNI, Services and optionally a service mesh.
+
+| Term | What it means |
+|---|---|
+| **Load balancer** | Spreads connections across nodes or pods (L4 or L7). In the cloud, it's the entry point in front of everything. |
+| **Ingress controller** | Implements the older Kubernetes `Ingress` object: HTTP routing by host and path. |
+| **API gateway** | Ingress plus API features: auth, rate limiting, request transformation, quotas, API keys. |
+| **Gateway API** | The newer Kubernetes standard that replaces Ingress, with `Gateway`, `HTTPRoute`, `GRPCRoute` and others. Many controllers implement it. |
+| **Service mesh** | Sidecar or eBPF layer for east-west traffic: mTLS, retries, telemetry between services. |
+| **BFF / app gateway** | Code you write that aggregates backends for a client. Your Go service is a small one. |
+
+## What Emissary-Ingress is
+
+Emissary-ingress is an open-source Kubernetes-native API gateway, Layer 7 load balancer and Ingress controller built on Envoy Proxy. It is a CNCF incubating project, formerly called Ambassador API Gateway. You configure it through its own CRDs (such as `Mapping`, `Host` and `Listener`), and it adds rate limiting, authentication filters, canary routing and more on top of Envoy.
+
+Things to know about its current state:
+
+- The project moved to a fully community-driven model, with a 4.0 line planned around a CRD API-group change, a side-by-side migration and a pivot toward the Kubernetes Gateway API. A 4.1.0 release is listed as of August 2026.
+- One 2026 ecosystem overview says Emissary is still maintained but has lost mindshare to Envoy Gateway, which uses the same Envoy with the standard Gateway API on top, and suggests new deployments default to Envoy Gateway. That is one author's view, but it matches where the ecosystem is heading.
+- The same article notes that the community ingress-nginx project reached end of life in March 2026. If you see older tutorials built on ingress-nginx, check them before copying.
+
+Emissary is worth learning if your workplace uses it. For a new lab, a Gateway API implementation is the better investment, because the skills transfer across products.
+
+## Which one to use
+
+| Option | Good for | Notes |
+|---|---|---|
+| **Cilium Gateway API** | Your lab as it is | Already part of Cilium, and Hubble can see it. Standard features only. |
+| **Envoy Gateway** | Learning gateway features beyond routing | Standard Gateway API plus policy resources for things like auth and rate limiting. Extra component to install. |
+| **Emissary-Ingress** | Existing Emissary shops, Ambassador-style APIs | Own CRDs, rich features, smaller community than before. |
+| **Kong, Traefik, NGINX Gateway Fabric** | Teams already on those products | Each has its own strengths and plugin ecosystem. |
+| **Cloud load balancer controllers** | Managed Kubernetes in a cloud | The provider's L7 load balancer acts as the gateway. |
+| **Service mesh (Istio, Linkerd, Cilium)** | mTLS and telemetry between A and B | A different problem (east-west), not a replacement for a gateway. |
+
+## Adding Cilium Gateway API to your cluster
+
+You already run Cilium with kube-proxy replacement, which is the main prerequisite. Enabling it means installing the Gateway API CRDs and setting the Cilium Helm option, after which the operator turns Gateway API resources into Cilium's Envoy configuration.
+
+**1. Install the CRDs for your Cilium version.** The required version changes between releases. For Cilium 1.19 the guide uses Gateway API v1.4.1, while the latest Cilium docs reference v1.5.1. Check `cilium version` and the Gateway API page in the Cilium docs for the matching one:
+
+```bash
+kubectl apply --server-side -f https://github.com/kubernetes-sigs/gateway-api/releases/download/<version>/standard-install.yaml
+```
+
+**2. Enable it and restart the Cilium pods:**
+
+```bash
+cilium upgrade --reuse-values --set kubeProxyReplacement=true --set gatewayAPI.enabled=true
+kubectl -n kube-system rollout restart deployment/cilium-operator
+kubectl -n kube-system rollout restart ds/cilium
+kubectl get gatewayclass            # should list "cilium"
+```
+
+**3. Create a Gateway and a route to service B:**
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: {name: lab-gateway, namespace: demo}
+spec:
+  gatewayClassName: cilium
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      allowedRoutes: {namespaces: {from: Same}}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: api-route, namespace: demo}
+spec:
+  parentRefs: [{name: lab-gateway}]
+  hostnames: ["api.lab.local"]
+  rules:
+    - matches: [{path: {type: PathPrefix, value: /}}]
+      backendRefs: [{name: api-service, port: 8080}]
+```
+
+**4. Reach it.** Cilium expects a load balancer IP from a cloud provider or MetalLB. On your VMware nodes there is neither, so the generated service shows `<pending>` for its external IP, but it still gets a NodePort. This should work, though I haven't run it:
+
+```bash
+kubectl -n demo get gateway,httproute
+kubectl -n demo get svc | grep cilium-gateway
+NODEPORT=$(kubectl -n demo get svc cilium-gateway-lab-gateway -o jsonpath='{.spec.ports[0].nodePort}')
+curl -H "Host: api.lab.local" http://192.168.17.135:$NODEPORT/products
+```
+
+If that fails, install MetalLB or enable Cilium's own load balancer IP management to give the gateway a real address.
+
+**5. Tighten the setup.** Once the gateway works, change `api-service` to a ClusterIP Service so the gateway is the only way in, and add a NetworkPolicy so `data-service` accepts traffic only from `api-service`. With Cilium, allow traffic from the gateway proxy to `api-service` in the policy too.
+
+## What this adds to your CNI learning
+
+```
+ curl -> node NodePort -> Cilium Envoy proxy (the Gateway)
+      -> eBPF/CNI path to the api-service pod (same node, or across VXLAN if it's on the other node)
+      -> api-service -> gRPC -> data-service pod
+```
+
+Compared with the earlier request path, there's one more hop, and the first leg ends in a proxy that opens a new connection to B. Hubble now shows traffic from the gateway's identity to B, and B's log shows the proxy's address rather than the client's (unless you use the `X-Forwarded-For` header).
+
+## Exercises to try with a gateway
+
+1. Route by path to two versions of the service: `/v1` to the current `api-service` and `/v2` to a copy.
+2. Split traffic by weight (90/10 canary) using `backendRefs` weights, and watch it in Hubble.
+3. Add a request header or URL rewrite with an `HTTPRoute` filter.
+4. Terminate TLS: a self-signed certificate (or cert-manager) in a Secret referenced from an HTTPS listener.
+5. Add timeouts and see how a slow `data-service` (use `tc netem` for delay) affects the response the client gets.
+6. For JWT auth or rate limiting, which standard Gateway API routes don't cover, try Envoy Gateway or Emissary next.
+
+## My suggestion
+
+1. Keep the NodePort for now, since it's enough to study the CNI path.
+2. Add Cilium Gateway API as the first gateway exercise. It builds on what you've set up.
+3. Later, add Envoy Gateway to learn auth and rate limiting.
+4. Learn Emissary-Ingress only if you meet it at work.
+5. Treat a service mesh for A↔B mTLS as a separate, later topic.
+
+If you'd like, I can write the full Gateway lab as files (the YAML, the weighted canary with a second version of the Go service, and a test script) in the same style as the earlier bundles.
+
+# How gRPC works in your lab
+
+Start from a plain function call. gRPC lets service B call a function that lives inside service A, as if it were local. Everything else is the machinery that makes that possible across two pods and two nodes.
+
+```
+ inside one program:      product = get_product(1)
+ gRPC, across the network:   B calls get_product(1)  ──network──>  A runs it and returns the product
+```
+
+## 1. The four ingredients
+
+| Ingredient | What it is | In your lab |
+|---|---|---|
+| **Contract** | A `.proto` file listing the functions and the data shapes | `proto/products.proto` |
+| **Protobuf** | A compact binary format for the data | the bytes inside each call |
+| **Generated code** | Functions generated from the contract, so you never write networking code | Go client stub in B, Rust server trait in A |
+| **HTTP/2** | The transport that carries the calls over one TCP connection | port 50051 |
+
+REST sends text (JSON) over HTTP/1.1, and you design the URLs yourself. gRPC sends binary over HTTP/2, and the URLs are generated from the contract.
+
+## 2. The contract
+
+This is the heart of it. Both services read the same file:
+
+```proto
+service ProductService {
+  rpc GetProduct(GetProductRequest) returns (Product);
+  rpc ListProducts(ListProductsRequest) returns (ListProductsResponse);
+  ...
+}
+
+message GetProductRequest { int32 id = 1; }
+message Product {
+  int32  id = 1;
+  string name = 2;
+  string category = 3;
+  double price = 4;
+  int32  stock = 5;
+}
+```
+
+Each `rpc` line is one remote function with its input type and output type. The numbers (`= 1`, `= 2`) are field numbers. They identify fields on the wire, so the names never travel over the network.
+
+## 3. From the contract to your code
+
+A tool called `protoc` reads the contract and generates code for each language. Your Dockerfiles run it at build time.
+
+```
+                    products.proto
+                         |
+          +--------------+---------------+
+          v                              v
+  Go (service B)                   Rust (service A)
+  generates a CLIENT:              generates a SERVER trait:
+  client.GetProduct(ctx, req)      trait ProductService { async fn get_product(...) }
+```
+
+In service B (Go) you call it like a local function:
+```go
+p, err := s.client.GetProduct(ctx, &pb.GetProductRequest{Id: id})
+```
+
+In service A (Rust) you implement the function:
+```rust
+async fn get_product(&self, request: Request<GetProductRequest>)
+        -> Result<Response<Product>, Status> {
+    let id = request.get_ref().id;
+    // look up db.json, return the product (or Status::not_found)
+}
+```
+
+Neither side writes any socket, HTTP or serialization code. The generated stub does it all. The two languages work together because both follow the same contract.
+
+## 4. What happens when B calls `GetProduct(1)`
+
+```
+ B (Go)                                                A (Rust)
+ handler calls client.GetProduct({Id: 1})              your get_product() runs
+      |                                                     ^
+      v   generated stub                                    |   generated server code
+ 1. protobuf encode  ->  08 01                         6. protobuf decode -> request struct
+      |                                                     ^
+      v                                                     |
+ 2. gRPC framing  ->  00 | 00 00 00 02 | 08 01          5. parse framing
+      |                                                     ^
+      v                                                     |
+ 3. HTTP/2 stream (HEADERS + DATA) --- TCP :50051 ------>  4. HTTP/2 stream
+      |
+      v
+ pod eth0 -> veth -> node B -> VXLAN -> node A -> veth -> pod eth0      <- the CNI's job
+```
+
+The reply makes the same trip in reverse, ending with your Go code receiving a `Product`.
+
+## 5. What is actually on the wire
+
+The request `GetProductRequest{id: 1}` is encoded as two bytes:
+
+```
+ 08 01
+ |  |
+ |  +-- value 1
+ +----- field number 1, type "number" (tag = field<<3 | type = 0x08)
+```
+
+gRPC adds a 5-byte prefix (a compression flag and a 4-byte length), and HTTP/2 wraps it in frames:
+
+```
+ CLIENT (B)                                              SERVER (A)
+   |-- TCP connect to 10.244.0.15:50051 ------------------->|
+   |-- HTTP/2 connection preface + SETTINGS --------------->|
+   |<-- SETTINGS --------------------------------------------|
+   |-- HEADERS (stream 1)                                    |
+   |     :method  POST                                      |
+   |     :path    /products.v1.ProductService/GetProduct     |
+   |     content-type: application/grpc                      |
+   |     grpc-timeout: 3S       (your 3 second deadline)     |
+   |-- DATA (stream 1)   00 | 00 00 00 02 | 08 01            |
+   |<-- HEADERS  :status 200 --------------------------------|
+   |<-- DATA     00 | length | <Product bytes> --------------|
+   |<-- HEADERS (trailers)  grpc-status: 0  (OK) ------------|
+```
+
+The call path comes from your contract: `/` + package (`products.v1`) + `.` + service (`ProductService`) + `/` + method (`GetProduct`). For a string field, such as `ListProductsRequest{category: "furniture"}`, the bytes are `0a 09 66 75 72 6e 69 74 75 72 65`: the tag, the length 9, then the ASCII letters. Compare that with the JSON text a REST call would carry.
+
+## 6. One connection, many calls
+
+HTTP/2 lets many calls share one TCP connection, each on its own stream. Go's gRPC client keeps one connection to A and reuses it for every request. This explains three things you'll see:
+
+- `conntrack` shows one long-lived connection to port 50051, not a new one per REST request.
+- The Rust log shows the same caller address (B's pod IP and port) for every call.
+- **Load balancing is by connection, not by call.** If you ran three copies of A behind the Service, B's single connection would stick to one of them. The fixes are a headless Service with client-side balancing, or an L7-aware layer such as a service mesh or Envoy gateway. With one replica this doesn't matter yet.
+
+## 7. Errors and deadlines
+
+Every gRPC call ends with a status code instead of an HTTP status:
+
+| gRPC status | Meaning | What B returns to the REST client |
+|---|---|---|
+| `OK` | success | 200 |
+| `NOT_FOUND` | A says no such product | 404 |
+| `INVALID_ARGUMENT` | bad input | 400 |
+| `DEADLINE_EXCEEDED` | A didn't answer within 3 seconds | 504 |
+| `UNAVAILABLE` | can't reach A (pod down, network problem) | 503 |
+
+B's code translates these in one function. The 3-second deadline travels with the call (`grpc-timeout`), so A knows how long the caller will wait and can abandon work when it passes.
+
+## 8. Four kinds of calls
+
+Your lab only uses the first kind, which is normal for most services.
+
+| Kind | Shape | Example use |
+|---|---|---|
+| **Unary** | one request, one response | `GetProduct` (your lab) |
+| **Server streaming** | one request, many responses | stream a large product list or live updates |
+| **Client streaming** | many requests, one response | upload data in chunks |
+| **Bidirectional** | both sides stream | chat, live sync |
+
+In the contract, streaming is just a keyword: `rpc Watch(WatchRequest) returns (stream Event);`.
+
+## 9. Why gRPC inside and REST outside
+
+| | REST + JSON | gRPC + protobuf |
+|---|---|---|
+| Format | text, human-readable | binary, compact |
+| Contract | optional (OpenAPI) | required, enforced by generated code |
+| Speed and size | larger, slower to parse | smaller, faster |
+| Streaming | awkward | built in |
+| Browsers | work directly | need a proxy (grpc-web) |
+| Debugging | `curl` is enough | needs `grpcurl` or Wireshark |
+
+That's why your design has service B: browsers and clients speak REST to B, and B speaks gRPC to A.
+
+## 10. See it yourself
+
+**Call A directly, skipping B:**
+```bash
+sudo snap install grpcurl            # or download from the grpcurl GitHub releases
+kubectl -n demo port-forward svc/data-service 50051:50051 &
+cd grpc-cni-lab-rust-go
+grpcurl -plaintext -import-path proto -proto products.proto \
+  -d '{"id": 1}' localhost:50051 products.v1.ProductService/GetProduct
+grpcurl -plaintext -import-path proto -proto products.proto \
+  -d '{"category": "furniture"}' localhost:50051 products.v1.ProductService/ListProducts
+```
+Then check A's log with `kubectl -n demo logs deploy/data-service`. You'll see each call, with the caller address.
+
+**Watch the bytes.** On the node running B (use the pod's veth name from earlier):
+```bash
+sudo tcpdump -ni <veth-or-ens33> -w grpc.pcap 'tcp port 50051'
+```
+Run `./scripts/test.sh`, then open `grpc.pcap` in Wireshark and use **Analyze → Decode As → HTTP2** on port 50051. You'll see the `:path`, the `grpc-status` trailer and the raw `00 00 00 00 02 08 01` body.
+
+**Break it on purpose:**
+```bash
+kubectl -n demo scale deploy/data-service --replicas=0   # B now returns 503 (UNAVAILABLE)
+kubectl -n demo scale deploy/data-service --replicas=1
+```
+Then add a delay on the node with `tc qdisc add dev <veth> root netem delay 4s` and watch B return 504 (DEADLINE_EXCEEDED). Remove it afterwards with `tc qdisc del dev <veth> root`.
+
+**Change the contract.** Add a field such as `string supplier = 6;` to `Product`, rebuild only service A, and call it from the old B. It still works, because old code ignores field numbers it doesn't know. That's how gRPC keeps services compatible while you upgrade them one at a time.
+
+## Common confusions
+
+- **gRPC isn't REST over HTTP/2.** It uses HTTP/2 as a pipe, but the paths, the binary bodies and the status trailers are its own rules.
+- **Field numbers matter, names don't.** Never reuse or renumber a field in a live contract.
+- **Your gRPC traffic is plaintext.** The lab uses insecure credentials. In production you'd add TLS or mTLS (a service mesh or Cilium can do this for you).
+- **The CNI doesn't know about gRPC.** It sees ordinary TCP packets to port 50051. Only an L7-aware layer (an Envoy proxy, or Cilium with L7 rules) understands the HTTP/2 and gRPC inside them.
+
+If you'd like, I can add a server-streaming call to the lab (for example `WatchProducts`, which streams every new product B creates), so you can watch a stream stay open across the CNI with `tcpdump`. I can also write a Wireshark-ready capture walkthrough that goes frame by frame through one real call.
