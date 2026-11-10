@@ -2876,3 +2876,764 @@ Then add a delay on the node with `tc qdisc add dev <veth> root netem delay 4s` 
 - **The CNI doesn't know about gRPC.** It sees ordinary TCP packets to port 50051. Only an L7-aware layer (an Envoy proxy, or Cilium with L7 rules) understands the HTTP/2 and gRPC inside them.
 
 If you'd like, I can add a server-streaming call to the lab (for example `WatchProducts`, which streams every new product B creates), so you can watch a stream stay open across the CNI with `tcpdump`. I can also write a Wireshark-ready capture walkthrough that goes frame by frame through one real call.
+
+The document describes two stages of the setup:
+
+1. **Initial setup:** Single-node Kubernetes with containerd and Flannel.
+2. **Extended setup:** Two-node Kubernetes cluster with Cilium, eBPF, VXLAN, and kube-proxy replacement.
+
+The diagram below represents the **extended two-node Cilium architecture**, which is the more complete architecture described in the document. [GitHub](https://raw.githubusercontent.com/sushink70/laniakea/refs/heads/main/docs/kube-containerd-cni/setup.md)
+
+# 1. Overall architecture
+
+```text
+                              ADMIN / CLIENT
+                   +----------------+----------------+
+                   |                                 |
+                kubectl                            curl
+                   |                                 |
+                   v                                 v
+          Node A :6443 (API)                Node B :30080 (NodePort)
+                   |                                 |
+                   +----------------+----------------+
+                                    |
++===============================================================================================+
+|                                    KUBERNETES CLUSTER                                         |
+|                                                                                               |
+|  Cluster Pod CIDR : 10.244.0.0/16                                                             |
+|  CNI              : Cilium (eBPF + VXLAN)                                                     |
+|  Service Routing  : Cilium eBPF (kube-proxy replacement)                                      |
+|                                                                                               |
+|  Cluster Services:                                                                            |
+|    CoreDNS        : 10.96.0.10  (DNS)                                                         |
+|    data-service   : 10.96.77.12:50051 (ClusterIP - illustrative)                              |
+|    api-service    : NodePort :30080                                                           |
+|                                                                                               |
+|  +-----------------------------------------+       +---------------------------------------+  |
+|  | NODE A - CONTROL PLANE                  |       | NODE B - WORKER                       |  |
+|  | VM IP: 192.168.17.135                   |       | VM IP: 192.168.17.136                 |  |
+|  | Pod CIDR: 10.244.0.0/24                 |       | Pod CIDR: 10.244.1.0/24               |  |
+|  |-----------------------------------------|       |---------------------------------------|  |
+|  |                                         |       |                                       |  |
+|  |  kube-apiserver :6443                   |       |  kubelet + containerd (CRI)           |  |
+|  |  etcd :2379                             |       |  Cilium CNI plugin                    |  |
+|  |  kube-scheduler                         |       |  Cilium agent (DaemonSet)             |  |
+|  |  kube-controller-manager                |       |  eBPF hooks / maps on lxc*            |  |
+|  |                                         |       |                                       |  |
+|  |  kubelet + containerd (CRI)             |       |  +---------------------------------+  |  |
+|  |  Cilium CNI plugin                      |       |  | api-service Pod (Go REST)       |  |  |
+|  |  Cilium agent (DaemonSet)               |       |  |                                 |  |  |
+|  |  eBPF hooks / maps on lxc*              |       |  | 10.244.1.23:8080                |  |  |
+|  |                                         |       |  +---------------------------------+  |  |
+|  |  +-----------------------------------+  |       |                                       |  |
+|  |  | data-service Pod (Rust gRPC)      |  |       |                                       |  |
+|  |  |                                   |  |       |                                       |  |
+|  |  | 10.244.0.15:50051                 |  |       |                                       |  |
+|  |  | db.json                           |  |       |                                       |  |
+|  |  +------------------+----------------+  |       |                                       |  |
+|  |                     | eth0              |       |                 | eth0                |  |
+|  |                    veth                 |       |                veth                   |  |
+|  |                    lxcA                 |       |                lxcB                   |  |
+|  |                 (tc/eBPF)               |       |             (tc/eBPF)                 |  |
+|  |                     |                   |       |                 |                     |  |
+|  |               cilium_vxlan              |       |          cilium_vxlan                 |  |
+|  |                     |                   |       |                 |                     |  |
+|  |                   ens33                 |       |               ens33                   |  |
+|  +---------------------+-------------------+       +-----------------+---------------------+  |
+|                        |                                             |                        |
++========================+=============================================+========================+
+                         |                                             |
+                         +------------ VXLAN UDP 8472 -----------------+
+                          VMware Underlay: 192.168.17.0/24
+
+                     Node A                              Node B
+                 192.168.17.135                      192.168.17.136
+```
+
+*Note: The IP addresses are examples taken from the document. Actual pod addresses may differ.*
+
+# 2. Application communication architecture
+
+The lab contains two microservices implemented in different programming languages.
+
+| Component | Technology | Responsibility |
+|---|---|---|
+| api-service | Go | REST API gateway |
+| data-service | Rust | gRPC server |
+| db.json | JSON | Mock product database |
+| CoreDNS | Kubernetes | Service name resolution |
+| Cilium | eBPF + VXLAN | Pod networking and service routing |
+
+Communication:
+
+- External client communicates using HTTP/REST.
+- Go API communicates with Rust service using gRPC.
+- Rust service accesses `db.json`.
+- Responses travel back through the same network path.
+
+### Request flow
+
+```text
+       EXTERNAL CLIENT
+              |
+              | HTTP GET /products
+              |
+              v
+     +----------------------+
+     | Node B               |
+     | 192.168.17.136       |
+     |                      |
+     | NodePort :30080      |
+     +----------+-----------+
+                |
+                | Cilium eBPF
+                | Service Load Balancing
+                v
+     +---------------------------+
+     | API SERVICE (Go)          |
+     |                           |
+     | Pod IP: 10.244.1.23       |
+     | Port :8080                |
+     +-------------+-------------+
+                   |
+                   | DNS lookup
+                   |
+                   v
+          +------------------+
+          | CoreDNS          |
+          |                  |
+          | ClusterIP        |
+          | 10.96.0.10       |
+          +--------+---------+
+                   |
+                   | Resolves:
+                   | data-service.demo.svc.cluster.local
+                   |
+                   v
+          +--------------------------+
+          | data-service ClusterIP   |
+          | 10.96.77.12:50051        |
+          +------------+-------------+
+                       |
+                       | Cilium eBPF
+                       | ClusterIP -> Pod IP
+                       v
+                10.244.0.15:50051
+                       |
+                       v
+          +--------------------------+
+          | NODE B                   |
+          |                          |
+          | API Pod                  |
+          |                          |
+          | eth0                     |
+          |  |                       |
+          | veth                     |
+          |  |                       |
+          | lxcB (eBPF)              |
+          |  |                       |
+          | cilium_vxlan             |
+          |  |                       |
+          | ens33                    |
+          +------------+-------------+
+                       |
+                       |
+              VXLAN ENCAPSULATION
+                 UDP PORT 8472
+                       |
+                       |
+             VMware Network
+           192.168.17.0/24
+                       |
+                       |
+              VXLAN DECAPSULATION
+                       |
+          +------------+-------------+
+          | NODE A                   |
+          |                          |
+          | ens33                    |
+          |  |                       |
+          | cilium_vxlan             |
+          |  |                       |
+          | lxcA (eBPF)              |
+          |  |                       |
+          | veth                     |
+          |  |                       |
+          | eth0                     |
+          |                          |
+          | DATA SERVICE (Rust)      |
+          |                          |
+          | 10.244.0.15:50051        |
+          |                          |
+          | db.json                  |
+          +--------------------------+
+                       |
+                       |
+                 gRPC RESPONSE
+                       |
+                       v
+                 API SERVICE
+                       |
+                       |
+                 HTTP RESPONSE
+                       |
+                       v
+                 EXTERNAL CLIENT
+```
+
+This is the key networking experiment in the repository: observing how traffic crosses from one Kubernetes node to another through Cilium's VXLAN overlay. [GitHub](https://raw.githubusercontent.com/sushink70/laniakea/refs/heads/main/docs/kube-containerd-cni/setup.md)
+
+# 3. Kubernetes pod creation architecture
+
+This explains how containerd and CNI work together when Kubernetes creates a pod.
+
+```text
+               kubectl apply -f k8s/
+                         |
+                         v
+                +------------------+
+                | kube-apiserver   |
+                +--------+---------+
+                         |
+                         v
+                +------------------+
+                | kube-scheduler   |
+                |                  |
+                | Selects Node B   |
+                +--------+---------+
+                         |
+                         v
+                +------------------+
+                | kubelet (Node B) |
+                +--------+---------+
+                         |
+                         | CRI (gRPC)
+                         | Unix socket
+                         v
+                +------------------+
+                | containerd       |
+                +--------+---------+
+                         |
+                         | RunPodSandbox
+                         |
+                         v
+                +------------------+
+                | CNI invocation   |
+                |                  |
+                | Read config:     |
+                | /etc/cni/net.d/  |
+                |                  |
+                | Execute plugin:  |
+                | /opt/cni/bin/    |
+                +--------+---------+
+                         |
+                         v
+                +------------------+
+                | Cilium CNI       |
+                |                  |
+                | Create network   |
+                | namespace        |
+                |                  |
+                | Create veth pair |
+                |                  |
+                | Assign Pod IP    |
+                +--------+---------+
+                         |
+                         v
+                +------------------+
+                | Cilium eBPF      |
+                |                  |
+                | Configure pod    |
+                | endpoint         |
+                |                  |
+                | Policy and       |
+                | forwarding maps  |
+                +--------+---------+
+                         |
+                         v
+                +------------------+
+                | Application Pod  |
+                |                  |
+                | eth0             |
+                | 10.244.1.x       |
+                +------------------+
+```
+
+**Important distinction:**
+
+| Component | Responsibility |
+|---|---|
+| kubelet | Manages pod lifecycle |
+| containerd | Creates containers and invokes CNI |
+| CNI plugin | Configures pod networking during creation/deletion |
+| Cilium agent | Maintains eBPF programs, policies and networking state |
+| eBPF | Handles packet processing, forwarding and service translation |
+| VXLAN | Provides communication between nodes |
+
+The CNI plugin is invoked during pod creation and deletion. The Cilium agent continues running as a DaemonSet on every node. [GitHub](https://raw.githubusercontent.com/sushink70/laniakea/refs/heads/main/docs/kube-containerd-cni/setup.md)
+
+# 4. Important networking distinction
+
+The setup originally uses Flannel and subsequently migrates to Cilium.
+
+The networking architecture differs:
+
+| Feature | Flannel | Cilium |
+|---|---|---|
+| Pod interface | veth | veth |
+| Host interface | veth | `lxc*` |
+| Linux bridge | `cni0` | Not used in this datapath |
+| Tunnel | `flannel.1` | `cilium_vxlan` |
+| Encapsulation | VXLAN | VXLAN |
+| Service routing | kube-proxy / iptables | eBPF |
+| NetworkPolicy | Not enforced | Enforced |
+| Observability | tcpdump | Hubble + tcpdump |
+| kube-proxy | Required for normal Service routing | Replaced by Cilium |
+
+The later Cilium configuration specifically uses:
+
+```bash
+kubeadm init \
+  --pod-network-cidr=10.244.0.0/16 \
+  --skip-phases=addon/kube-proxy
+```
+
+And:
+
+```bash
+cilium install \
+  --set kubeProxyReplacement=true \
+  --set k8sServiceHost=192.168.17.135 \
+  --set k8sServicePort=6443 \
+  --set ipam.mode=kubernetes
+```
+
+This means Cilium takes responsibility for Kubernetes Service routing instead of kube-proxy. [GitHub](https://raw.githubusercontent.com/sushink70/laniakea/refs/heads/main/docs/kube-containerd-cni/setup.md)
+
+---
+
+## 5. Additional components surrounding the architecture
+
+There are also supporting components worth understanding:
+
+| Component | Purpose |
+|---|---|
+| Docker | Builds Go and Rust application images |
+| containerd | Runs Kubernetes containers |
+| kubeadm | Initializes and joins cluster nodes |
+| kubectl | Kubernetes administration |
+| Cilium Operator | Cilium cluster-level operations |
+| Hubble | Network flow visibility |
+| bpftool | Inspects loaded eBPF programs and maps |
+| tcpdump | Captures actual network packets |
+| VMware | Provides the underlying VM network |
+
+**One important detail:** Docker is used for building application images, not as Kubernetes' container runtime. The images are imported into containerd on both nodes.
+
+**My recommendation:** Start by understanding diagrams 1 and 2. Together, they explain the entire architecture: Kubernetes control plane, container runtime, CNI, eBPF datapath, VXLAN overlay, DNS, Service routing, and microservice communication.
+
+Understood. You want a **three-node Kubernetes cluster**, where Node A is exclusively the Control Plane, and Nodes B and C are Worker Nodes.
+
+The application placement will be:
+
+- **Node A:** Kubernetes Control Plane — manages the entire cluster.
+- **Node B:** Go REST API service.
+- **Node C:** Rust gRPC data service.
+
+This is a better separation of responsibilities. It also gives you a genuine cross-worker networking scenario: Go on Node B communicates with Rust on Node C through the Kubernetes networking layer.
+
+# 1. Updated three-node architecture
+
+```text
+                         ADMINISTRATOR
+                               |
+                         kubectl commands
+                               |
+                               v
++------------------------------------------------------------------+
+|                      KUBERNETES CLUSTER                          |
+|                                                                  |
+|  Cluster Pod CIDR : 10.244.0.0/16                                |
+|  Container Runtime: containerd                                   |
+|  CNI              : Cilium (eBPF + VXLAN)                        |
+|  Service Routing  : Cilium eBPF (kube-proxy replacement)         |
+|                                                                  |
+|  +---------------------------+                                   |
+|  | NODE A                    |                                   |
+|  | CONTROL PLANE             |                                   |
+|  |                           |                                   |
+|  | kube-apiserver            |                                   |
+|  | etcd                      |                                   |
+|  | kube-scheduler            |                                   |
+|  | kube-controller-manager   |                                   |
+|  |                           |                                   |
+|  | kubelet                   |                                   |
+|  | containerd                |                                   |
+|  | Cilium Agent              |                                   |
+|  |                           |                                   |
+|  | NO APPLICATION PODS       |                                   |
+|  +-------------+-------------+                                   |
+|                |                                                 |
+|                | Kubernetes API :6443                            |
+|                |                                                 |
+|       +--------+-------------------------+                       |
+|       |                                  |                       |
+|       v                                  v                       |
+|  +---------------------------+    +---------------------------+  |
+|  | NODE B                    |    | NODE C                    |  |
+|  | WORKER NODE               |    | WORKER NODE               |  |
+|  |                           |    |                           |  |
+|  | kubelet                   |    | kubelet                   |  |
+|  | containerd                |    | containerd                |  |
+|  | Cilium Agent              |    | Cilium Agent              |  |
+|  |                           |    |                           |  |
+|  | +-----------------------+ |    | +-----------------------+ |  |
+|  | | Go REST API           | |    | | Rust gRPC Service     | |  |
+|  | |                       | |    | |                       | |  |
+|  | | Port: 8080            | |    | | Port: 50051           | |  |
+|  | |                       | |    | |                       | |  |
+|  | | Pod CIDR: 10.244.1.x  | |    | | Pod CIDR: 10.244.2.x  | |  |
+|  | +-----------+-----------+ |    | +-----------+-----------+ |  |
+|  |             |             |    |             |             |  |
+|  |         veth/eBPF         |    |         veth/eBPF         |  |
+|  |             |             |    |             |             |  |
+|  |        cilium_vxlan       |    |        cilium_vxlan       |  |
+|  +-------------+-------------+    +-------------+-------------+  |
+|                |                                ^                |
+|                +========= VXLAN ================+                |
+|                         UDP 8472                                 |
+|                                                                  |
++------------------------------------------------------------------+
+```
+
+# 2. Application communication flow
+
+This is the important part of your project.
+
+```text
+                 EXTERNAL CLIENT
+                        |
+                        | HTTP :30080
+                        v
+              +----------------------+
+              | NODE B               |
+              | Go REST API          |
+              | Pod :8080            |
+              +----------+-----------+
+                         |
+                         | gRPC :50051
+                         |
+                         | DNS resolution:
+                         | data-service.demo.svc.cluster.local
+                         |
+                         v
+              +----------------------+
+              | Kubernetes Service   |
+              | data-service         |
+              | ClusterIP :50051     |
+              +----------+-----------+
+                         |
+                         | Endpoint resolution
+                         v
+              +----------------------+
+              | CNI / eBPF           |
+              |                      |
+              | VXLAN encapsulation  |
+              +----------+-----------+
+                         |
+                         | UDP :8472
+                         |
+                         | Node B --> Node C
+                         |
+                         v
+              +----------------------+
+              | NODE C               |
+              | Rust gRPC Service    |
+              | Pod :50051           |
+              |                      |
+              | db.json              |
+              +----------------------+
+                         |
+                         |
+                   gRPC Response
+                         |
+                         v
+                    NODE B
+                         |
+                         v
+                  HTTP Response
+                         |
+                         v
+                 EXTERNAL CLIENT
+```
+
+Notice that **Node A is not involved in application data traffic**. It manages the cluster, while the CNI handles communication between B and C.
+
+# 3. Changes required in your existing project
+
+I inspected your uploaded ZIP and found that your current project has two assumptions that need changing.
+
+### Change 1: Rust Deployment
+
+Existing file:
+
+`grpc-cni-lab-rust-go/k8s/10-data-service.yaml`
+
+Currently:
+
+```yaml
+nodeSelector:
+  lab-role: node-a
+```
+
+Change it to:
+
+```yaml
+nodeSelector:
+  lab-role: node-c
+```
+
+### Change 2: Go Deployment
+
+File:
+
+`grpc-cni-lab-rust-go/k8s/20-api-service.yaml`
+
+Keep this unchanged:
+
+```yaml
+nodeSelector:
+  lab-role: node-b
+```
+
+### Change 3: Deployment script
+
+Your existing `deploy.sh` accepts two nodes:
+
+```bash
+./scripts/deploy.sh <node-a> <node-b>
+```
+
+It needs three:
+
+```bash
+./scripts/deploy.sh <control-plane> <worker-b> <worker-c>
+```
+
+The updated script assigns:
+
+| Kubernetes node | Label |
+|---|---|
+| Node A | No application label |
+| Node B | `lab-role=node-b` |
+| Node C | `lab-role=node-c` |
+
+It also ensures Node A has the `NoSchedule` control-plane taint.
+
+### Change 4: Container images
+
+Your existing `build-and-load.sh` accepts only one worker.
+
+Now it needs to transfer application images to both workers:
+
+```bash
+./scripts/build-and-load.sh user@NODE_B_IP user@NODE_C_IP
+```
+
+This is important because your manifests use:
+
+```yaml
+imagePullPolicy: Never
+```
+
+Containerd image storage is local to each node. Loading an image on Node A does not make it available on B or C.
+
+---
+
+# 4. Setting up the three nodes
+
+Follow this sequence.
+
+**Step 1: Prepare Node B**
+
+```bash
+sudo ./scripts/worker-prep.sh k8s-worker-b
+```
+
+**Step 2: Prepare Node C**
+
+```bash
+sudo ./scripts/worker-prep.sh k8s-worker-c
+```
+
+Run the same worker preparation script on both machines.
+
+**Step 3: Join both workers**
+
+On Node A:
+
+```bash
+sudo kubeadm token create --print-join-command
+```
+
+Copy the generated command.
+
+Execute it with `sudo` on Node B and Node C.
+
+On Node A, verify:
+
+```bash
+kubectl get nodes -o wide
+```
+
+You should see three nodes in `Ready` state.
+
+**Step 4: Verify CNI**
+
+For Cilium:
+
+```bash
+kubectl get pods -n kube-system -o wide
+cilium status --wait
+```
+
+You should see a Cilium agent on each of the three nodes.
+
+Do not install another CNI when adding Node C. The existing CNI DaemonSet should configure it automatically.
+
+**Step 5: Build and distribute application images**
+
+On Node A:
+
+```bash
+./scripts/build-and-load.sh \
+  user@NODE_B_IP \
+  user@NODE_C_IP
+```
+
+**Step 6: Deploy applications**
+
+On Node A:
+
+```bash
+kubectl get nodes
+```
+
+Get the exact node names and execute:
+
+```bash
+./scripts/deploy.sh \
+  <NODE_A_NAME> \
+  <NODE_B_NAME> \
+  <NODE_C_NAME>
+```
+
+**Step 7: Verify application placement**
+
+```bash
+kubectl get pods -n demo -o wide
+```
+
+Expected:
+
+```text
+NAME                             READY   STATUS    NODE
+api-service-xxxxxxxx             1/1     Running   k8s-worker-b
+data-service-xxxxxxxx            1/1     Running   k8s-worker-c
+```
+
+Test:
+
+```bash
+./scripts/test.sh http://NODE_B_IP:30080
+```
+
+Check `/whoami` to confirm both applications are running on different worker nodes.
+
+---
+
+# 5. How you will manage everything from Node A
+
+You only need `kubectl` configured on Node A.
+
+For example:
+
+**View all nodes:**
+```bash
+kubectl get nodes -o wide
+```
+
+**View all pods across all nodes:**
+```bash
+kubectl get pods -A -o wide
+```
+
+**View application placement:**
+```bash
+kubectl get pods -n demo -o wide
+```
+
+**View Node C's Rust service logs:**
+```bash
+kubectl logs -n demo deployment/data-service
+```
+
+**View Node B's Go service logs:**
+```bash
+kubectl logs -n demo deployment/api-service
+```
+
+**Restart the Rust application:**
+```bash
+kubectl rollout restart deployment/data-service -n demo
+```
+
+**Restart the Go application:**
+```bash
+kubectl rollout restart deployment/api-service -n demo
+```
+
+You can also manage worker scheduling, deployments, services, networking and monitoring from Node A.
+
+For operating-system administration, such as installing packages or checking system services, SSH is still used.
+
+---
+
+# 6. Network ports to consider
+
+Since you are using VMware and VXLAN, make sure these paths are permitted:
+
+| Source | Destination | Port | Purpose |
+|---|---|---|---|
+| Node B, C | Node A | TCP 6443 | Kubernetes API |
+| Node A | Node B, C | TCP 10250 | Kubelet management |
+| Node A, B, C | Each other | UDP 8472 | VXLAN overlay |
+| Node A | Node B, C | TCP 22 | SSH/image transfer |
+| External client | Node B | TCP 30080 | REST API |
+
+The gRPC port 50051 is used inside the Kubernetes pod network; you do not need to expose it externally.
+
+These port requirements assume the VXLAN datapath. Native-routing Cilium configurations have different networking requirements.
+
+---
+
+# 7. Updated project ZIP
+
+I've modified your uploaded project to implement this three-node design.
+
+**laniakea-three-node.zip[Download updated three-node Kubernetes project](sandbox:/mnt/data/laniakea-three-node.zip)**
+
+Changes included:
+
+- Rust Deployment pinned to Node C.
+- Go Deployment remains pinned to Node B.
+- Deployment script accepts three node names.
+- Control-plane scheduling protection restored.
+- Image distribution supports both workers.
+- Worker preparation instructions updated for B and C.
+- CNI tracing instructions updated for B-to-C traffic.
+- README rewritten with the three-node architecture and setup procedure.
+
+I validated the modified shell scripts and Kubernetes YAML syntax. I haven't executed the deployment against your actual VMware cluster.
+
+**One architectural recommendation:** Keep Node A dedicated to the Kubernetes Control Plane. Don't remove its `NoSchedule` taint as the original two-node instructions suggested. This ensures your application workloads stay on Nodes B and C, while Node A centrally manages the entire cluster.
