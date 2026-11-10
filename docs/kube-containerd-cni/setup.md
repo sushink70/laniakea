@@ -3637,3 +3637,156 @@ Changes included:
 I validated the modified shell scripts and Kubernetes YAML syntax. I haven't executed the deployment against your actual VMware cluster.
 
 **One architectural recommendation:** Keep Node A dedicated to the Kubernetes Control Plane. Don't remove its `NoSchedule` taint as the original two-node instructions suggested. This ensures your application workloads stay on Nodes B and C, while Node A centrally manages the entire cluster.
+
+In your setup there are two meanings of "data plane". Here is how to find each one.
+
+## 1. Which node is the control plane
+
+```bash
+kubectl get nodes -o wide
+```
+The control-plane node shows `control-plane` under ROLES. The worker nodes show `<none>`.
+
+```bash
+kubectl get nodes --show-labels | grep control-plane
+kubectl describe node <node-name> | grep -E "Roles|Taints"
+```
+
+You can also check on the node itself:
+
+```bash
+ls /etc/kubernetes/manifests/
+# kube-apiserver.yaml  etcd.yaml  kube-scheduler.yaml  kube-controller-manager.yaml
+```
+**Any node that has these four files is a control-plane node.** Workers don't have them.
+
+```bash
+kubectl get pods -n kube-system -o wide | grep -E "apiserver|etcd|scheduler|controller-manager"
+```
+The NODE column shows where the control-plane pods run.
+
+## 2. Which node is the data plane
+
+The data plane is the nodes that run your workloads (kubelet, containerd, pods), so these are your worker nodes:
+
+```bash
+kubectl get nodes --selector='!node-role.kubernetes.io/control-plane'
+kubectl get pods -A -o wide     # see which node each pod runs on
+```
+
+## 3. Your setup
+
+From the guide, you ran `kubeadm init` on the VM at `192.168.17.135` and removed the control-plane taint with:
+```bash
+kubectl taint nodes --all node-role.kubernetes.io/control-plane-
+```
+So **`192.168.17.135` is the control plane and also acts as a worker**. That is a single-node lab where both planes live on one machine.
+
+If you later joined a second VM (e.g. `192.168.17.136`) using `kubeadm join`, that VM is your dedicated data-plane node.
+
+To confirm the taint state:
+```bash
+kubectl describe node | grep -i taint
+```
+- `Taints: <none>` means workloads can run on the control plane.
+- `NoSchedule` means it is control-plane only.
+
+## 4. Networking meaning (CNI and Cilium)
+
+Sometimes "data plane" means the components that actually move packets, as opposed to the components that decide the configuration:
+
+| Control plane (decides) | Data plane (moves traffic) |
+|---|---|
+| kube-apiserver, etcd, scheduler | veth pairs, `cni0` bridge or `lxc*` |
+| CNI agent logic (Flannel/Cilium agent) | VXLAN tunnel (`flannel.1` / `cilium_vxlan`) |
+| Cilium operator | eBPF programs and maps, iptables rules |
+| CoreDNS config, Service/Endpoints objects | kube-proxy rules, the kernel network stack |
+
+You can see the data plane on any node:
+```bash
+ip -br link | grep -E "lxc|veth|cni0|flannel|cilium"
+sudo bpftool net show          # Cilium eBPF hooks
+sudo iptables -t nat -L -n     # kube-proxy rules
+```
+
+If you paste the output of `kubectl get nodes -o wide`, I can tell you exactly which of your nodes plays which role.
+
+Flannel has no UI or CLI. It is a CNI plugin that runs as a DaemonSet pod, and you inspect it through that pod, its config files and the network interfaces it creates.
+
+## What Flannel is used for
+
+Flannel gives your pods a network. Its jobs are:
+
+1. **Assign each node a pod subnet.** Your node got `10.244.0.0/24`, a slice of the `10.244.0.0/16` you passed to `kubeadm init`.
+2. **Connect pods across nodes.** It builds a VXLAN tunnel (`flannel.1`) so a pod on one node can reach a pod on another using pod IPs. Your node annotations show `backend-type: vxlan`, `VNI: 1` and the tunnel's MAC address.
+3. **Make the node `Ready`.** Without a CNI, the node stays `NotReady` and CoreDNS stays `Pending`. Your condition `NetworkUnavailable: FlannelIsUp` shows Flannel is running.
+
+Flannel does **not** enforce NetworkPolicy, load-balance Services (kube-proxy does that), or encrypt traffic by default.
+
+## How to access it
+
+**1. The Flannel pod.** Yours is `kube-flannel-ds-bk5hw` in the `kube-flannel` namespace.
+```bash
+kubectl -n kube-flannel get pods -o wide
+kubectl -n kube-flannel logs kube-flannel-ds-bk5hw
+kubectl -n kube-flannel describe pod kube-flannel-ds-bk5hw
+```
+
+**2. Its configuration.**
+```bash
+kubectl -n kube-flannel get configmap kube-flannel-cfg -o yaml
+```
+The `net-conf.json` field holds the network CIDR (`10.244.0.0/16`) and the backend type (vxlan).
+
+**3. Files on the node.** These need no `kubectl`:
+```bash
+cat /run/flannel/subnet.env          # subnet and MTU this node was given
+cat /etc/cni/net.d/10-flannel.conflist   # what containerd calls when a pod starts
+ls /opt/cni/bin/                     # the flannel binary lives here
+```
+
+**3. The interfaces and routes it creates.**
+```bash
+ip -d link show flannel.1            # VXLAN device: id 1, dstport 8472
+ip addr show cni0                    # the bridge, usually 10.244.0.1
+bridge link                          # pod veth pairs attached to cni0
+ip route | grep 10.244               # routes to pod subnets
+bridge fdb show dev flannel.1        # remote node entries (empty until you add a second node)
+```
+
+**4. What the node itself tells you.**
+```bash
+kubectl get node iamcloud-vmware-virtual-platform -o yaml | grep flannel
+```
+
+## What you will see on your cluster
+
+With one node there is no cross-node VXLAN traffic yet. Flannel currently only hands out IPs and wires pods to `cni0`. The VXLAN tunnel does real work once you join a second node. You can then watch it with:
+```bash
+sudo tcpdump -ni ens33 udp port 8472
+```
+
+If you'd like, I can show you how to trace one pod's path through `cni0` and `flannel.1` on your cluster.
+
+Flannel sits between your pods and the network. The coral boxes in the diagram are the Flannel parts, purple is the control plane, and teal is your pods.
+
+## Reading the diagram
+
+1. **The node agents ask Flannel for a network.** When a pod starts, kubelet tells containerd, and containerd calls the Flannel CNI plugin. That is the arrow from "Node agents" to "Flannel".
+2. **Flannel sets up the pod.** It gives the pod an IP from `10.244.0.0/24` and creates a veth pair. That is the arrow from Flannel to "Pods".
+3. **Pod traffic goes through the bridge.** The veth connects to the `cni0` bridge, which has the IP `10.244.0.1`.
+4. **Cross-node traffic goes into the tunnel.** Traffic for pods on other nodes goes to `flannel.1`, the VXLAN device, which wraps it in UDP port 8472.
+5. **The tunnel leaves through `ens33`.** The wrapped packets travel over your VMware network (`192.168.17.x`) to the other node.
+
+## What exists on your cluster today
+
+- **Flannel is running:** your node shows `FlannelIsUp`, and the pod `kube-flannel-ds-bk5hw` is running in the `kube-flannel` namespace.
+- **The VXLAN part is idle:** the dashed arrow to "Other node" is empty because you have only one node. Pod-to-pod traffic stays on `cni0` and never enters `flannel.1`.
+- **Flannel is not the control plane.** The control plane (purple) decides what runs where. Flannel only provides the pod network, and the node stays `NotReady` without it.
+
+To see these parts on your node:
+```bash
+ip addr show cni0
+ip -d link show flannel.1
+bridge link
+```
