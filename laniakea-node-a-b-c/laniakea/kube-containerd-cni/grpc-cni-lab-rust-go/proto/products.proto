@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+package products.v1;
+
+// Used by Go codegen (service B). Rust (prost/tonic) ignores it.
+option go_package = "api-service/gen/productspb";
+
+// Contract between Service B (Go REST gateway) and Service A (Rust data service)
+service ProductService {
+  rpc ListProducts(ListProductsRequest) returns (ListProductsResponse);
+  rpc GetProduct(GetProductRequest) returns (Product);
+  rpc CreateProduct(CreateProductRequest) returns (Product);
+  rpc DeleteProduct(DeleteProductRequest) returns (DeleteProductResponse);
+  // Where is this service running? Useful to see pod/node/IP during CNI experiments.
+  rpc Info(InfoRequest) returns (InfoResponse);
+}
+
+message Product {
+  int32 id = 1;
+  string name = 2;
+  string category = 3;
+  double price = 4;
+  int32 stock = 5;
+}
+
+message ListProductsRequest { string category = 1; }
+message ListProductsResponse { repeated Product products = 1; }
+
+message GetProductRequest { int32 id = 1; }
+
+message CreateProductRequest {
+  string name = 1;
+  string category = 2;
+  double price = 3;
+  int32 stock = 4;
+}
+
+message DeleteProductRequest { int32 id = 1; }
+message DeleteProductResponse { bool deleted = 1; }
+
+message InfoRequest {}
+message InfoResponse {
+  string service = 1;
+  string pod_name = 2;
+  string node_name = 3;
+  string pod_ip = 4;
+  int32 product_count = 5;
+}

@@ -1,0 +1,10 @@
+{
+  "products": [
+    {"id": 1, "name": "Mechanical Keyboard", "category": "electronics", "price": 89.99, "stock": 25},
+    {"id": 2, "name": "USB-C Hub",            "category": "electronics", "price": 34.50, "stock": 60},
+    {"id": 3, "name": "Standing Desk",        "category": "furniture",   "price": 349.00, "stock": 8},
+    {"id": 4, "name": "Ergonomic Chair",      "category": "furniture",   "price": 219.00, "stock": 12},
+    {"id": 5, "name": "Notebook (A5)",        "category": "stationery",  "price": 4.25,  "stock": 300},
+    {"id": 6, "name": "Gel Pen Pack",         "category": "stationery",  "price": 6.75,  "stock": 150}
+  ]
+}

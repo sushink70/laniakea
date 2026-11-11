@@ -1,0 +1,62 @@
+# Rust gRPC data service -> pinned to worker Node C (lab-role=node-c)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: data-service
+  namespace: demo
+  labels: {app: data-service}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: data-service}
+  template:
+    metadata:
+      labels: {app: data-service}
+    spec:
+      nodeSelector:
+        lab-role: node-c
+      containers:
+        - name: data-service
+          image: lab/data-service-rs:1.0
+          imagePullPolicy: Never          # image is loaded into containerd by scripts/build-and-load.sh
+          ports:
+            - containerPort: 50051
+              name: grpc
+          env:
+            - {name: GRPC_PORT, value: "50051"}
+            - {name: DB_PATH,   value: /data/db.json}
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+            - name: POD_IP
+              valueFrom: {fieldRef: {fieldPath: status.podIP}}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+          readinessProbe:
+            tcpSocket: {port: 50051}
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket: {port: 50051}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits:   {cpu: 500m, memory: 256Mi}
+      volumes:
+        - name: data
+          emptyDir: {}                   # JSON "database"; resets if the pod is recreated
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: data-service
+  namespace: demo
+spec:
+  type: ClusterIP
+  selector: {app: data-service}
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: 50051
